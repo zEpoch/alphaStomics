@@ -1,0 +1,141 @@
+# AlphaSTomics 配置文件
+# 双模态扩散模型：表达量 + 3D坐标
+
+# ==================== 训练模式 ====================
+# 可选: "expr_to_pos", "pos_to_expr", "joint"
+training_mode: "joint"
+
+# ==================== 扩散模型参数 ====================
+diffusion:
+  diffusion_steps: 1000
+  diffusion_noise_schedule: "cosine"
+  nu_expression: 1.0  # 表达量的噪声调度参数
+  nu_position: 1.0    # 位置的噪声调度参数
+
+# ==================== 损失函数参数 ====================
+loss:
+  lambda_expression: 1.0      # 表达量损失权重
+  lambda_position: 1.0        # 位置损失权重
+  use_distance_matrix: true   # 是否使用距离矩阵（旋转不变）
+
+# ==================== 训练参数 ====================
+training:
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  batch_size: 32
+  epochs: 100
+  precision: "16-mixed"          # 训练精度: "32", "16-mixed", "bf16-mixed"
+  gradient_clip_val: 1.0         # 梯度裁剪
+  accumulate_grad_batches: 1     # 梯度累积
+  early_stopping: true           # 是否早停
+  patience: 10                   # 早停耐心值
+  scheduler:
+    type: "cosine"
+    T_max: 100
+    eta_min: 1e-6
+
+# ==================== 分布式训练参数 ====================
+distributed:
+  enabled: false                  # 是否启用分布式训练
+  strategy: "ddp"                 # 分布式策略: "ddp", "ddp_find_unused_parameters_true", "fsdp", "deepspeed"
+  num_nodes: 1                    # 节点数量（机器数量）
+  devices: "auto"                 # GPU 数量: "auto", 整数, 或列表 [0, 1, 2]
+  find_unused_parameters: false   # 是否查找未使用的参数（调试用）
+  sync_batchnorm: true            # 是否同步 BatchNorm
+  
+  # DeepSpeed 配置（仅当 strategy="deepspeed" 时生效）
+  deepspeed:
+    stage: 2                      # ZeRO stage: 1, 2, 3
+    offload_optimizer: false      # 是否将优化器卸载到 CPU
+    offload_parameters: false     # 是否将参数卸载到 CPU
+  
+  # FSDP 配置（仅当 strategy="fsdp" 时生效）
+  fsdp:
+    sharding_strategy: "FULL_SHARD"  # FULL_SHARD, SHARD_GRAD_OP, NO_SHARD
+    cpu_offload: false
+
+# ==================== 模型架构参数 ====================
+
+# 表达量输入 MLP
+mlp_in_expression_setting: 
+  mlp_in_expression_dims: 128
+  mlp_out_expression_dims: 256
+
+# 扩散时间输入 MLP
+mlp_in_diffusion_time_setting:
+  mlp_in_diffusion_time_dims: 64
+  mlp_out_diffusion_time_dims: 64
+
+# 位置 MLP
+PositionMLP_setting:
+  hidden_dims: 64
+
+# 表达量输出维度
+output_expression_dims: 256
+
+# Transformer 层参数
+TransformerLayer_setting:
+  num_layers: 6
+  num_heads: 8
+  dim_ff_expression: 1024
+  dim_ff_diffusion_time: 256
+  dropout: 0.1
+  layer_norm_eps: 1e-6
+
+# 表达量输出 MLP
+mlp_out_expression_setting:
+  hidden_dims: 512
+
+# 位置范数输出 MLP
+mlp_out_position_norm_setting:
+  hidden_dims: 128
+
+# ==================== 数据参数 ====================
+data:
+  # 原始数据路径（包含 h5ad 文件的目录）
+  raw_data_dir: "./data/raw"
+  # 预处理后数据路径
+  processed_data_dir: "./data/processed"
+  
+  # 预处理参数
+  preprocessing:
+    gene_list_file: null          # 固定基因列表文件（每行一个基因名）
+    position_key: "ccf"           # AnnData.obsm 中坐标的 key
+    position_is_3d: true          # 坐标是否已经是 3D（CCF 坐标系）
+    z_spacing: 1.0                # 切片间的 z 间距（仅当 position_is_3d=false 时使用）
+    cell_type_key: "cell_type"    # 细胞类型的 key
+    scale: true                   # 是否进行表达量 scale
+    normalize_position: true      # 是否标准化坐标
+  
+  # 数据加载参数
+  loading:
+    mode: "slice"                 # 训练模式: "slice"(切片级) 或 "cell"(细胞级)
+    num_workers: 4                # 数据加载线程数
+    train_ratio: 0.8              # 训练集比例
+    val_ratio: 0.1                # 验证集比例
+    expression_dropout: 0.1      # 表达量 dropout 比例
+    rotation: true               # 是否随机旋转
+  
+  # 数据划分比例
+  split_ratio:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+
+# ==================== 采样参数 ====================
+sampling:
+  num_steps: 100         # 采样步数（可以小于 diffusion_steps 加速）
+  mode: "joint"          # 采样模式: "expr_to_pos", "pos_to_expr", "joint"
+
+# ==================== 日志和保存 ====================
+logging:
+  logger: "tensorboard"          # 日志记录器: "tensorboard", "wandb"
+  wandb_project: "alphastomics"  # WandB 项目名
+  log_every_n_steps: 10          # 每 N 步记录一次
+  save_top_k: 3                  # 保存最好的 K 个模型
+  save_dir: "./outputs"          # 输出目录
+
+# ==================== 评估参数 ====================
+evaluation:
+  k_neighbors: 10                # kNN 相关指标使用的 k 值
+  compute_spatial_metrics: true  # 是否计算空间指标
