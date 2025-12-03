@@ -2,6 +2,14 @@
 from .noise_model import NoiseModel
 from .loss import DualModalLoss
 from .sample import DiffusionSampler
+from .masking import (
+    MaskGenerator,
+    MaskToken,
+    MaskedDiffusionModule,
+    MaskedDiffusionLoss,
+    MaskingConfig,
+    MaskInfo,
+)
 from .train import (
     AlphaSTomicsModule,
     create_model_from_config,
@@ -14,9 +22,20 @@ from .train import (
 )
 
 __all__ = [
+    # 核心模块
     'NoiseModel',
     'DualModalLoss',
     'DiffusionSampler',
+    
+    # Masked Diffusion
+    'MaskGenerator',
+    'MaskToken',
+    'MaskedDiffusionModule',
+    'MaskedDiffusionLoss',
+    'MaskingConfig',
+    'MaskInfo',
+    
+    # 训练
     'AlphaSTomicsModule',
     'create_model_from_config',
     'get_distributed_strategy',

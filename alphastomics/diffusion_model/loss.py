@@ -2,10 +2,14 @@
 DualModalLoss: 双模态损失函数
 - 表达量: MSE Loss
 - 位置: 距离矩阵 MSE Loss（旋转平移不变）
+- Masked Reconstruction: 只在被 mask 的位置计算重建损失
 """
 import torch
 import torch.nn as nn
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from alphastomics.diffusion_model.masking import MaskInfo
 
 
 class DualModalLoss(nn.Module):
@@ -23,7 +27,8 @@ class DualModalLoss(nn.Module):
         self,
         lambda_expression: float = 1.0,
         lambda_position: float = 1.0,
-        use_distance_matrix: bool = True
+        use_distance_matrix: bool = True,
+        lambda_masked_reconstruction: float = 0.5
     ):
         """
         初始化损失函数
@@ -32,11 +37,13 @@ class DualModalLoss(nn.Module):
             lambda_expression: 表达量损失权重
             lambda_position: 位置损失权重
             use_distance_matrix: 是否使用距离矩阵计算位置损失（旋转不变）
+            lambda_masked_reconstruction: Masked 重建损失权重
         """
         super().__init__()
         self.lambda_expression = lambda_expression
         self.lambda_position = lambda_position
         self.use_distance_matrix = use_distance_matrix
+        self.lambda_masked_reconstruction = lambda_masked_reconstruction
         self.mse = nn.MSELoss(reduction='none')
         
     def compute_expression_loss(
@@ -197,6 +204,67 @@ class DualModalLoss(nn.Module):
         log_dict["loss/total"] = total_loss.item()
         
         return total_loss, log_dict
+    
+    def compute_masked_reconstruction_loss(
+        self,
+        pred_expression: torch.Tensor,
+        pred_positions: torch.Tensor,
+        mask_info: 'MaskInfo',
+        node_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        计算 Masked Reconstruction 损失
+        
+        只在被 mask 的位置计算重建损失
+        
+        Args:
+            pred_expression: (B, N, G) 预测的表达量
+            pred_positions: (B, N, 3) 预测的位置
+            mask_info: MaskInfo 实例，包含 mask 信息
+            node_mask: (B, N) 节点掩码
+        
+        Returns:
+            recon_loss: 重建损失
+            log_dict: 损失日志
+        """
+        device = pred_expression.device
+        total_recon_loss = torch.tensor(0.0, device=device)
+        log_dict = {}
+        
+        # 表达量重建损失
+        if mask_info.expression_mask is not None and mask_info.original_expression is not None:
+            expr_mask = mask_info.expression_mask
+            original = mask_info.original_expression
+            
+            # 结合节点掩码
+            effective_mask = expr_mask & node_mask.unsqueeze(-1).bool()
+            
+            if effective_mask.sum() > 0:
+                masked_pred = pred_expression[effective_mask]
+                masked_target = original[effective_mask]
+                expr_recon_loss = torch.nn.functional.mse_loss(masked_pred, masked_target)
+                total_recon_loss = total_recon_loss + expr_recon_loss
+                log_dict["loss/masked_expr_reconstruction"] = expr_recon_loss.item()
+        
+        # 位置重建损失
+        if mask_info.position_mask is not None and mask_info.original_position is not None:
+            pos_mask = mask_info.position_mask
+            original = mask_info.original_position
+            
+            effective_mask = pos_mask & node_mask.unsqueeze(-1).bool()
+            
+            if effective_mask.sum() > 0:
+                masked_pred = pred_positions[effective_mask]
+                masked_target = original[effective_mask]
+                pos_recon_loss = torch.nn.functional.mse_loss(masked_pred, masked_target)
+                total_recon_loss = total_recon_loss + pos_recon_loss
+                log_dict["loss/masked_pos_reconstruction"] = pos_recon_loss.item()
+        
+        # 应用权重
+        weighted_loss = self.lambda_masked_reconstruction * total_recon_loss
+        log_dict["loss/masked_reconstruction_total"] = weighted_loss.item()
+        
+        return weighted_loss, log_dict
 
 
 class ExpressionOnlyLoss(nn.Module):

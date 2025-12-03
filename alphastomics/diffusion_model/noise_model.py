@@ -1,14 +1,18 @@
 """
 NoiseModel: 双模态噪声模型
 支持同时对表达量和位置加噪
+支持 Masked Diffusion (对特征维度进行 masking)
 """
 import torch
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 from alphastomics.utils.dataholder import DataHolder, remove_mean_with_mask
 from alphastomics.diffusion_model.diffusion_utils import (
     cosine_beta_schedule_discrete,
     sample_gaussian_with_mask,
 )
+
+if TYPE_CHECKING:
+    from alphastomics.diffusion_model.masking import MaskedDiffusionModule, MaskInfo
 
 
 class NoiseModel:
@@ -18,6 +22,10 @@ class NoiseModel:
     同时处理表达量和位置的扩散过程：
     - 表达量: z_t^{expr} = α_t * x_{expr} + σ_t * ε_{expr}
     - 位置:   z_t^{pos}  = α_t * x_{pos}  + σ_t * ε_{pos}
+    
+    支持 Masked Diffusion:
+    - 可选地对加噪后的特征进行 masking
+    - 强迫模型从部分观测重建完整信息
     """
     
     def __init__(self, cfg: dict):
@@ -171,8 +179,10 @@ class NoiseModel:
         self,
         data: DataHolder,
         noise_expression: bool = True,
-        noise_position: bool = True
-    ) -> DataHolder:
+        noise_position: bool = True,
+        masking_module: Optional['MaskedDiffusionModule'] = None,
+        apply_masking: bool = False
+    ) -> Tuple[DataHolder, Optional['MaskInfo']]:
         """
         对数据应用噪声（前向扩散过程）
         
@@ -180,9 +190,12 @@ class NoiseModel:
             data: 包含原始数据的 DataHolder
             noise_expression: 是否对表达量加噪
             noise_position: 是否对位置加噪
+            masking_module: MaskedDiffusionModule 实例（可选）
+            apply_masking: 是否应用 masking
         
         Returns:
             noisy_data: 包含噪声数据的 DataHolder
+            mask_info: MaskInfo 实例（如果应用了 masking）
         """
         batch_size = data.expression.shape[0]
         device = data.expression.device
@@ -224,8 +237,19 @@ class NoiseModel:
             noisy_data.noisy_positions = alpha_pos * data.positions + sigma_pos * noise_pos
         else:
             noisy_data.noisy_positions = data.positions
+        
+        # 应用 Masking（在加噪后）
+        mask_info = None
+        if masking_module is not None and apply_masking:
+            masked_expr, masked_pos, mask_info = masking_module.apply_masking(
+                expression=noisy_data.noisy_expression,
+                position=noisy_data.noisy_positions,
+                apply=True
+            )
+            noisy_data.noisy_expression = masked_expr
+            noisy_data.noisy_positions = masked_pos
             
-        return noisy_data
+        return noisy_data, mask_info
     
     def sample_limit_dist(
         self,

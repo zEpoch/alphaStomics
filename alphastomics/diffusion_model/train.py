@@ -27,6 +27,11 @@ from alphastomics.attn_model.model import Model
 from alphastomics.diffusion_model.noise_model import NoiseModel
 from alphastomics.diffusion_model.loss import DualModalLoss
 from alphastomics.diffusion_model.sample import DiffusionSampler
+from alphastomics.diffusion_model.masking import (
+    MaskedDiffusionModule,
+    MaskingConfig,
+    MaskInfo,
+)
 from alphastomics.utils.dataholder import DataHolder
 from alphastomics.utils.metrics import MetricsCalculator, print_metrics
 
@@ -41,6 +46,11 @@ class AlphaSTomicsModule(pl.LightningModule):
     - "expr_to_pos": 表达量 → 位置（原始 LUNA 任务）
     - "pos_to_expr": 位置 → 表达量
     - "joint": 联合训练（两者都加噪）
+    
+    支持 Masked Diffusion:
+    - 对加噪后的特征进行 masking
+    - 强迫模型从部分观测重建完整信息
+    - 可配置 mask 比例、策略等
     """
     
     def __init__(
@@ -82,11 +92,27 @@ class AlphaSTomicsModule(pl.LightningModule):
         
         # 初始化损失函数
         loss_cfg = cfg.get("loss", {})
+        masking_cfg = cfg.get("masking", {})
+        
         self.loss_fn = DualModalLoss(
             lambda_expression=loss_cfg.get("lambda_expression", 1.0),
             lambda_position=loss_cfg.get("lambda_position", 1.0),
-            use_distance_matrix=loss_cfg.get("use_distance_matrix", True)
+            use_distance_matrix=loss_cfg.get("use_distance_matrix", True),
+            lambda_masked_reconstruction=masking_cfg.get("reconstruction_weight", 0.5)
         )
+        
+        # 初始化 Masked Diffusion 模块（可选）
+        self.masking_module = None
+        self.masking_config = None
+        
+        if masking_cfg.get("enable", False):
+            self.masking_config = MaskingConfig.from_dict(masking_cfg)
+            self.masking_module = MaskedDiffusionModule(
+                expression_dim=num_genes,
+                position_dim=3,
+                config=self.masking_config
+            )
+            logger.info(f"Masked Diffusion 已启用: {self.masking_config.to_dict()}")
         
         # 评估指标计算器
         self.metrics_calculator = MetricsCalculator(k_neighbors=10)
@@ -97,6 +123,7 @@ class AlphaSTomicsModule(pl.LightningModule):
         # 训练统计
         self.train_losses = []
         self.val_losses = []
+        self._global_step = 0
     
     def forward(
         self,
@@ -161,11 +188,19 @@ class AlphaSTomicsModule(pl.LightningModule):
         noise_expression = self.training_mode in ["pos_to_expr", "joint"]
         noise_position = self.training_mode in ["expr_to_pos", "joint"]
         
-        # 应用噪声
-        noisy_data = self.noise_model.apply_noise(
+        # 确定是否应用 masking
+        apply_masking = False
+        if self.masking_module is not None:
+            self.masking_module.set_step(self._global_step)
+            apply_masking = self.masking_module.should_apply_masking()
+        
+        # 应用噪声（和可选的 masking）
+        noisy_data, mask_info = self.noise_model.apply_noise(
             batch,
             noise_expression=noise_expression,
-            noise_position=noise_position
+            noise_position=noise_position,
+            masking_module=self.masking_module,
+            apply_masking=apply_masking
         )
         
         # 模型预测
@@ -176,7 +211,7 @@ class AlphaSTomicsModule(pl.LightningModule):
             node_mask=batch.node_mask
         )
         
-        # 计算损失
+        # 计算扩散损失
         loss, log_dict = self.loss_fn(
             pred_expression=pred_expression,
             pred_positions=pred_positions,
@@ -187,6 +222,20 @@ class AlphaSTomicsModule(pl.LightningModule):
             compute_position=noise_position
         )
         
+        # 计算 Masked Reconstruction 损失（如果启用）
+        if mask_info is not None and mask_info.has_mask():
+            recon_loss, recon_log_dict = self.loss_fn.compute_masked_reconstruction_loss(
+                pred_expression=pred_expression,
+                pred_positions=pred_positions,
+                mask_info=mask_info,
+                node_mask=batch.node_mask
+            )
+            loss = loss + recon_loss
+            log_dict.update(recon_log_dict)
+            log_dict["masking/applied"] = 1.0
+        else:
+            log_dict["masking/applied"] = 0.0
+        
         # 记录日志
         self.log_dict(
             {f"train/{k}": v for k, v in log_dict.items()},
@@ -195,19 +244,24 @@ class AlphaSTomicsModule(pl.LightningModule):
             prog_bar=True,
             batch_size=batch.batch_size
         )
+        
+        self._global_step += 1
 
         
         return loss
     
     def validation_step(self, batch: DataHolder, batch_idx: int) -> torch.Tensor:
-        """验证步骤"""
+        """验证步骤（不使用 masking）"""
         noise_expression = self.training_mode in ["pos_to_expr", "joint"]
         noise_position = self.training_mode in ["expr_to_pos", "joint"]
         
-        noisy_data = self.noise_model.apply_noise(
+        # 验证时不使用 masking
+        noisy_data, _ = self.noise_model.apply_noise(
             batch,
             noise_expression=noise_expression,
-            noise_position=noise_position
+            noise_position=noise_position,
+            masking_module=None,
+            apply_masking=False
         )
         
         pred_expression, pred_positions = self.forward(

@@ -18,6 +18,21 @@ loss:
   lambda_position: 1.0        # 位置损失权重
   use_distance_matrix: true   # 是否使用距离矩阵（旋转不变）
 
+# ==================== Masked Diffusion 参数 ====================
+# Masked Diffusion: 对每个细胞内部的特征维度进行 masking
+# 增强模型鲁棒性，学习特征间依赖关系
+masking:
+  enable: false                      # 是否启用 Masked Diffusion
+  expression_mask_ratio: 0.4         # 表达量 mask 比例 (0.0-1.0)
+  position_mask_ratio: 0.33          # 坐标 mask 比例 (0.0-1.0)
+  mask_strategy: "random"            # mask 策略: "random", "block", "structured"
+  mask_expression: true              # 是否 mask 表达量
+  mask_position: true                # 是否 mask 坐标
+  reconstruction_weight: 0.5         # 重建损失权重
+  masking_probability: 0.5           # 每个 batch 应用 masking 的概率
+  progressive_masking: false         # 是否渐进式增加 mask ratio
+  progressive_steps: 10000           # 渐进式 masking 的步数
+
 # ==================== 训练参数 ====================
 training:
   learning_rate: 1e-4
