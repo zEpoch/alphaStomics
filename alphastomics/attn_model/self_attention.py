@@ -164,13 +164,23 @@ class SelfAttentionModel(nn.Module):
         transformed_positions = self.transform_positions_for_attention(position_features)
         transformed_diffusion_time = self.transform_diffusion_time(diffusion_time)
         
-        # 处理时间维度
-        if len(diffusion_time.shape) == 2:
-            # (B, dim) -> (B, 1, dim) -> (B, N, dim)
-            time_expanded = diffusion_time.unsqueeze(1).expand(-1, n, -1)
+        # 处理时间维度 - 使用转换后的时间特征（具有正确的维度）
+        # 注意：last_layer 时 transformed_diffusion_time 为 None，需要直接使用原始 diffusion_time
+        if transformed_diffusion_time is not None:
+            time_for_concat = transformed_diffusion_time
         else:
+            # last_layer 情况：使用原始 diffusion_time
+            time_for_concat = diffusion_time
+        
+        # 确保时间维度正确扩展到 (B, N, dim)
+        if len(time_for_concat.shape) == 2:
+            # (B, dim) -> (B, 1, dim) -> (B, N, dim)
+            time_expanded = time_for_concat.unsqueeze(1).expand(-1, n, -1)
+        elif len(time_for_concat.shape) == 3:
             # (B, 1, dim) -> (B, N, dim)
-            time_expanded = diffusion_time.expand(-1, n, -1)
+            time_expanded = time_for_concat.expand(-1, n, -1)
+        else:
+            raise ValueError(f"Unexpected time_for_concat shape: {time_for_concat.shape}")
         
         # 拼接所有特征
         concatenated_features = torch.cat(

@@ -86,11 +86,11 @@ class NoiseModel:
             key: "expr" 或 "pos"
         
         Returns:
-            alpha_bar: (B, 1) 对应的 alpha_bar 值
+            alpha_bar: (B,) 对应的 alpha_bar 值
         """
         idx = self.inverse_mapping[key]
         a = self._alphas_bar.to(t_int.device)[t_int.long(), idx]
-        return a.float()
+        return a.float().squeeze(-1)  # 确保返回 (B,)
     
     def get_sigma_bar(
         self,
@@ -105,11 +105,11 @@ class NoiseModel:
             key: "expr" 或 "pos"
         
         Returns:
-            sigma_bar: (B, 1) 对应的 sigma_bar 值
+            sigma_bar: (B,) 对应的 sigma_bar 值
         """
         idx = self.inverse_mapping[key]
         s = self._sigma_bar.to(t_int.device)[t_int.long(), idx]
-        return s.float()
+        return s.float().squeeze(-1)  # 确保返回 (B,)
     
     def get_alpha_ts(
         self,
@@ -218,8 +218,8 @@ class NoiseModel:
             noise_expr = torch.randn_like(data.expression)
             noise_expr = noise_expr * data.node_mask.unsqueeze(-1)
             
-            alpha_expr = self.get_alpha_bar(t_int=t_int, key="expr").unsqueeze(-1)  # (B, 1, 1)
-            sigma_expr = self.get_sigma_bar(t_int=t_int, key="expr").unsqueeze(-1)  # (B, 1, 1)
+            alpha_expr = self.get_alpha_bar(t_int=t_int, key="expr").view(-1, 1, 1)  # (B, 1, 1)
+            sigma_expr = self.get_sigma_bar(t_int=t_int, key="expr").view(-1, 1, 1)  # (B, 1, 1)
             
             noisy_data.noisy_expression = alpha_expr * data.expression + sigma_expr * noise_expr
         else:
@@ -231,8 +231,8 @@ class NoiseModel:
             noise_pos = noise_pos * data.node_mask.unsqueeze(-1)
             noise_pos = remove_mean_with_mask(noise_pos, data.node_mask)
             
-            alpha_pos = self.get_alpha_bar(t_int=t_int, key="pos").unsqueeze(-1)  # (B, 1, 1)
-            sigma_pos = self.get_sigma_bar(t_int=t_int, key="pos").unsqueeze(-1)  # (B, 1, 1)
+            alpha_pos = self.get_alpha_bar(t_int=t_int, key="pos").view(-1, 1, 1)  # (B, 1, 1)
+            sigma_pos = self.get_sigma_bar(t_int=t_int, key="pos").view(-1, 1, 1)  # (B, 1, 1)
             
             noisy_data.noisy_positions = alpha_pos * data.positions + sigma_pos * noise_pos
         else:
@@ -351,9 +351,9 @@ class NoiseModel:
             z_t_prefactor = (self.get_alpha_ts(s_int=s_int, t_int=t_int, key="expr") * sigma_sq_ratio)
             pred_prefactor = self.get_prefactor(s_int=s_int, t_int=t_int, key="expr")
             
-            # 扩展维度
-            z_t_prefactor = z_t_prefactor.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-            pred_prefactor = pred_prefactor.unsqueeze(-1).unsqueeze(-1)
+            # 确保系数是 (B, 1, 1) 用于广播
+            z_t_prefactor = z_t_prefactor.view(-1, 1, 1)  # (B, 1, 1)
+            pred_prefactor = pred_prefactor.view(-1, 1, 1)  # (B, 1, 1)
             
             # 计算均值
             mu_expr = z_t_prefactor * z_t.noisy_expression + pred_prefactor * pred_expression
@@ -367,7 +367,7 @@ class NoiseModel:
             alpha_ts_sq = self.get_alpha_ts_sq(s_int=s_int, t_int=t_int, key="expr")
             sigma2_t_s = sigma_t - sigma_s * alpha_ts_sq
             noise_prefactor = torch.sqrt(torch.clamp(sigma2_t_s * sigma_sq_ratio, min=0))
-            noise_prefactor = noise_prefactor.unsqueeze(-1).unsqueeze(-1)
+            noise_prefactor = noise_prefactor.view(-1, 1, 1)  # (B, 1, 1)
             
             z_s.noisy_expression = mu_expr + noise_prefactor * noise_expr
         
@@ -377,9 +377,9 @@ class NoiseModel:
             z_t_prefactor = (self.get_alpha_ts(s_int=s_int, t_int=t_int, key="pos") * sigma_sq_ratio)
             pred_prefactor = self.get_prefactor(s_int=s_int, t_int=t_int, key="pos")
             
-            # 扩展维度
-            z_t_prefactor = z_t_prefactor.unsqueeze(-1).unsqueeze(-1)
-            pred_prefactor = pred_prefactor.unsqueeze(-1).unsqueeze(-1)
+            # 确保系数是 1D (B,) 然后扩展到 (B, 1, 1) 用于广播
+            z_t_prefactor = z_t_prefactor.view(-1, 1, 1)  # (B, 1, 1)
+            pred_prefactor = pred_prefactor.view(-1, 1, 1)  # (B, 1, 1)
             
             # 计算均值
             mu_pos = z_t_prefactor * z_t.noisy_positions + pred_prefactor * pred_positions
@@ -394,7 +394,7 @@ class NoiseModel:
             alpha_ts_sq = self.get_alpha_ts_sq(s_int=s_int, t_int=t_int, key="pos")
             sigma2_t_s = sigma_t - sigma_s * alpha_ts_sq
             noise_prefactor = torch.sqrt(torch.clamp(sigma2_t_s * sigma_sq_ratio, min=0))
-            noise_prefactor = noise_prefactor.unsqueeze(-1).unsqueeze(-1)
+            noise_prefactor = noise_prefactor.view(-1, 1, 1)  # (B, 1, 1)
             
             z_s.noisy_positions = mu_pos + noise_prefactor * noise_pos
             # 中心化

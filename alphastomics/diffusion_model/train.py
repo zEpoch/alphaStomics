@@ -252,6 +252,9 @@ class AlphaSTomicsModule(pl.LightningModule):
     
     def validation_step(self, batch: DataHolder, batch_idx: int) -> torch.Tensor:
         """验证步骤（不使用 masking）"""
+        # 将 batch 转换为 DataHolder 格式
+        batch = self._prepare_batch(batch)
+        
         noise_expression = self.training_mode in ["pos_to_expr", "joint"]
         noise_position = self.training_mode in ["expr_to_pos", "joint"]
         

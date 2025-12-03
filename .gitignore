@@ -6,6 +6,8 @@ checkpoints_stereoseq/
 logs_stereoseq/
 wandb/
 .h5ad
+demo_train.log
+demo_train.py
 # C extensions
 *.so
 *.txt
