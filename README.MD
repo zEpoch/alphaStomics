@@ -1,7 +1,7 @@
 # AlphaSTomics - 双模态空间转录组扩散模型
 
 <p align="center">
-	<b>同时对基因表达量和3D空间坐标进行扩散建模</b>
+<b>同时对基因表达量和3D空间坐标进行扩散建模</b>
 </p>
 
 <p align="center">
@@ -18,6 +18,7 @@
 AlphaSTomics 是一个先进的空间转录组学数据建模框架，基于扩散模型和 Transformer 架构。支持**双模态扩散**，可以同时对基因表达量和空间坐标进行生成与重建。
 
 ## 核心特性（保留）
+
 - 双模态生成：表达量 + 3D 坐标
 - Masked Diffusion（特征级 masking）
 - 训练模式：`expr_to_pos` / `pos_to_expr` / `joint`
@@ -30,6 +31,7 @@ AlphaSTomics 是一个先进的空间转录组学数据建模框架，基于扩�
 ---
 
 ## **功能一：双模态生成**
+
 - **说明**: 同时建模基因表达（expression, (B,N,G)）和 3D 坐标（position, (B,N,3)）。
 
 - **示例**:
@@ -43,6 +45,7 @@ expression, positions = sampler.sample(expr, pos, mask, mode='joint')
 ---
 
 ## **功能二：Masked Diffusion (MDT)**
+
 - **说明**: 对每个细胞内部的特征维度（基因或 x/y/z）进行 mask，重建损失仅在 mask 上计算。
 
 - **示例（启用）**:
