@@ -4,14 +4,21 @@ AlphaSTomics - 双模态空间转录组扩散模型
 主入口文件
 
 用法:
-    # 预处理数据
+    # 方式一：使用旧版预处理（单阶段，直接从 h5ad 预处理）
     python main.py preprocess --input_dir ./raw_h5ad --output_dir ./processed
     
-    # 训练模型
+    # 方式二：使用新版两阶段预处理（推荐，内存友好，支持 HuggingFace）
+    python main.py preprocess2 --input_dir ./raw_h5ad --output_dir ./dataset --format parquet
+    
+    # 训练模型（支持两种数据格式）
     python main.py train --config config.yaml --data_dir ./processed
+    python main.py train --config config.yaml --data_dir ./dataset --data_format parquet --streaming
     
     # 测试模型
     python main.py test --config config.yaml --checkpoint ./outputs/checkpoints/last.ckpt
+    
+    # 采样生成
+    python main.py sample --checkpoint ./outputs/checkpoints/last.ckpt --input_data ./input.pt
     
     # 提取 embedding
     python main.py extract --checkpoint ./outputs/checkpoints/last.ckpt --data_dir ./processed
@@ -38,11 +45,11 @@ def load_config(config_path: str) -> dict:
 
 
 def cmd_preprocess(args):
-    """预处理 h5ad 数据"""
+    """预处理 h5ad 数据（旧版单阶段）"""
     from alphastomics.utils.dataloader import SpatialDataPreprocessor
     
     logger.info("=" * 50)
-    logger.info("数据预处理")
+    logger.info("数据预处理（旧版单阶段）")
     logger.info("=" * 50)
     
     # 加载配置
@@ -81,9 +88,68 @@ def cmd_preprocess(args):
     logger.info(f"  总细胞数: {metadata['total_cells']}")
 
 
+def cmd_preprocess2(args):
+    """两阶段预处理（新版，内存友好，支持 HuggingFace）"""
+    from alphastomics.preprocessing import Stage1Preprocessor, Stage2BatchGenerator
+    
+    logger.info("=" * 50)
+    logger.info("数据预处理（新版两阶段）")
+    logger.info("=" * 50)
+    
+    # 加载配置
+    cfg = load_config(args.config) if args.config else {}
+    preprocess_cfg = cfg.get("data", {}).get("preprocessing", {})
+    
+    output_dir = Path(args.output_dir)
+    intermediate_dir = output_dir / '_intermediate_slices'
+    
+    # ===== 阶段一：切片预处理 =====
+    logger.info("")
+    logger.info("阶段一：切片预处理 (log normalize + scale)")
+    logger.info("-" * 40)
+    
+    preprocessor = Stage1Preprocessor(
+        gene_list_file=args.gene_list_file or preprocess_cfg.get("gene_list_file"),
+        position_key=args.position_key or preprocess_cfg.get("position_key", "spatial"),
+        position_is_3d=args.position_is_3d or preprocess_cfg.get("position_is_3d", False),
+        z_spacing=args.z_spacing or preprocess_cfg.get("z_spacing", 10.0),
+        cell_type_key=args.cell_type_key or preprocess_cfg.get("cell_type_key", "cell_type"),
+        scale=preprocess_cfg.get("scale", True),
+        normalize_position=preprocess_cfg.get("normalize_position", True),
+    )
+    
+    stage1_metadata = preprocessor.process(args.input_dir, str(intermediate_dir))
+    
+    # ===== 阶段二：生成数据集 =====
+    logger.info("")
+    logger.info("阶段二：生成数据集 (无放回采样)")
+    logger.info("-" * 40)
+    
+    generator = Stage2BatchGenerator(
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        max_shard_size=args.max_shard_size,
+    )
+    
+    stats = generator.process(
+        str(intermediate_dir), 
+        str(output_dir), 
+        output_format=args.format
+    )
+    
+    logger.info("")
+    logger.info("=" * 50)
+    logger.info("预处理完成!")
+    logger.info(f"  输出目录: {output_dir}")
+    logger.info(f"  训练集: {stats['train']['n_cells']:,} 细胞")
+    logger.info(f"  验证集: {stats['validation']['n_cells']:,} 细胞")
+    logger.info(f"  测试集: {stats['test']['n_cells']:,} 细胞")
+    logger.info("=" * 50)
+
+
 def cmd_train(args):
     """训练模型"""
-    from alphastomics.utils.dataloader import create_dataloaders
     from alphastomics.diffusion_model.train import (
         train, 
         create_model_from_config,
@@ -101,27 +167,56 @@ def cmd_train(args):
     logger.info(f"训练模式: {cfg.get('training_mode', 'joint')}")
     logger.info(f"扩散步数: {cfg.get('diffusion', {}).get('diffusion_steps', 1000)}")
     
-    # 创建数据加载器
+    # 数据配置
     data_dir = args.data_dir or cfg.get("data", {}).get("processed_data_dir", "./data/processed")
     loading_cfg = cfg.get("data", {}).get("loading", {})
     training_cfg = cfg.get("training", {})
     
-    # 选择训练模式：slice（切片级）或 cell（细胞级）
-    data_mode = args.data_mode or loading_cfg.get("mode", "slice")
-    batch_size = training_cfg.get("batch_size", 1 if data_mode == "slice" else 256)
+    # 检测数据格式
+    data_format = args.data_format or 'auto'
+    if data_format == 'auto':
+        data_path = Path(data_dir)
+        if (data_path / 'data').exists():  # parquet 格式
+            data_format = 'parquet'
+        else:
+            data_format = 'pickle'
     
-    train_loader, val_loader, test_loader, metadata = create_dataloaders(
-        data_dir=data_dir,
-        mode=data_mode,
-        batch_size=batch_size,
-        num_workers=loading_cfg.get("num_workers", 4),
-    )
+    logger.info(f"数据格式: {data_format}")
     
-    num_genes = metadata.get("n_genes", len(metadata.get("selected_genes", [])))
-    logger.info(f"数据模式: {data_mode}")
+    # 创建数据加载器
+    if data_format == 'parquet':
+        # 使用新的 parquet 数据加载
+        from alphastomics.preprocessing import create_dataloaders
+        
+        batch_size = args.batch_size or training_cfg.get("batch_size", 1024)
+        
+        train_loader, val_loader, test_loader, metadata = create_dataloaders(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            num_workers=loading_cfg.get("num_workers", 4),
+            streaming=args.streaming,
+            buffer_size=args.buffer_size or 10000,
+        )
+        
+        num_genes = metadata.get('n_genes', metadata.get('features', {}).get('expression', {}).get('shape', [3000])[0])
+        
+    else:
+        # 使用旧的 pickle 数据加载
+        from alphastomics.utils.dataloader import create_dataloaders as create_dataloaders_old
+        
+        data_mode = args.data_mode or loading_cfg.get("mode", "slice")
+        batch_size = training_cfg.get("batch_size", 1 if data_mode == "slice" else 256)
+        
+        train_loader, val_loader, test_loader, metadata = create_dataloaders_old(
+            data_dir=data_dir,
+            mode=data_mode,
+            batch_size=batch_size,
+            num_workers=loading_cfg.get("num_workers", 4),
+        )
+        
+        num_genes = metadata.get("n_genes", len(metadata.get("selected_genes", [])))
+    
     logger.info(f"基因数量: {num_genes}")
-    logger.info(f"训练样本: {len(train_loader.dataset)}")
-    logger.info(f"验证样本: {len(val_loader.dataset)}")
     
     # 训练
     model = train(
@@ -303,6 +398,28 @@ def cmd_extract(args):
     logger.info(f"Position embedding shape: {embeddings['position_embeddings'].shape}")
 
 
+def cmd_upload(args):
+    """上传数据集到 HuggingFace Hub"""
+    from alphastomics.preprocessing.upload_to_hf import upload_dataset_to_hf
+    
+    logger.info("=" * 50)
+    logger.info("AlphaSTomics - 上传到 HuggingFace Hub")
+    logger.info("=" * 50)
+    
+    logger.info(f"数据目录: {args.data_dir}")
+    logger.info(f"目标仓库: {args.repo_id}")
+    logger.info(f"私有仓库: {args.private}")
+    
+    upload_dataset_to_hf(
+        data_dir=args.data_dir,
+        repo_id=args.repo_id,
+        private=args.private,
+        token=args.token
+    )
+    
+    logger.info("上传完成!")
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
@@ -312,8 +429,8 @@ def main():
     
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
     
-    # 预处理命令
-    preprocess_parser = subparsers.add_parser("preprocess", help="预处理 h5ad 数据")
+    # ==================== 预处理命令（旧版）====================
+    preprocess_parser = subparsers.add_parser("preprocess", help="预处理 h5ad 数据（旧版单阶段）")
     preprocess_parser.add_argument("--input_dir", type=str, required=True, help="输入 h5ad 文件目录")
     preprocess_parser.add_argument("--output_dir", type=str, required=True, help="输出预处理数据目录")
     preprocess_parser.add_argument("--config", type=str, default=None, help="配置文件路径")
@@ -321,24 +438,46 @@ def main():
     preprocess_parser.add_argument("--position_key", type=str, default=None, help="坐标 key（默认 ccf）")
     preprocess_parser.add_argument("--z_spacing", type=float, default=None, help="切片间 z 间距（仅2D模式）")
     
-    # 训练命令
+    # ==================== 预处理命令（新版两阶段）====================
+    preprocess2_parser = subparsers.add_parser("preprocess2", help="预处理（新版两阶段，推荐）")
+    preprocess2_parser.add_argument("--input_dir", "-i", type=str, required=True, help="输入 h5ad 文件目录")
+    preprocess2_parser.add_argument("--output_dir", "-o", type=str, required=True, help="输出数据目录")
+    preprocess2_parser.add_argument("--config", type=str, default=None, help="配置文件路径")
+    preprocess2_parser.add_argument("--gene_list_file", "-g", type=str, default=None, help="固定基因列表文件")
+    preprocess2_parser.add_argument("--position_key", type=str, default="spatial", help="坐标 key")
+    preprocess2_parser.add_argument("--position_is_3d", action="store_true", help="坐标是否为 3D")
+    preprocess2_parser.add_argument("--z_spacing", type=float, default=10.0, help="切片间 z 间距")
+    preprocess2_parser.add_argument("--cell_type_key", type=str, default="cell_type", help="细胞类型 key")
+    preprocess2_parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例")
+    preprocess2_parser.add_argument("--val_ratio", type=float, default=0.1, help="验证集比例")
+    preprocess2_parser.add_argument("--format", choices=["parquet", "pickle"], default="parquet", help="输出格式")
+    preprocess2_parser.add_argument("--max_shard_size", type=int, default=100000, help="每个分片最大细胞数")
+    preprocess2_parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    
+    # ==================== 训练命令 ====================
     train_parser = subparsers.add_parser("train", help="训练模型")
     train_parser.add_argument("--config", type=str, required=True, help="配置文件路径")
     train_parser.add_argument("--data_dir", type=str, default=None, help="预处理数据目录")
+    train_parser.add_argument("--data_format", type=str, choices=["parquet", "pickle", "auto"], default="auto",
+                              help="数据格式: parquet(新版), pickle(旧版), auto(自动检测)")
     train_parser.add_argument("--data_mode", type=str, choices=["slice", "cell"], default=None, 
-                              help="数据模式: slice(切片级) 或 cell(细胞级)")
+                              help="数据模式: slice(切片级) 或 cell(细胞级)，仅 pickle 格式")
+    train_parser.add_argument("--batch_size", type=int, default=None, help="批次大小")
+    train_parser.add_argument("--streaming", action="store_true", help="流式加载数据（大数据集推荐）")
+    train_parser.add_argument("--buffer_size", type=int, default=None, help="流式加载的 shuffle buffer 大小")
     train_parser.add_argument("--resume", type=str, default=None, help="恢复训练的检查点路径")
     train_parser.add_argument("--test_after_train", action="store_true", help="训练后运行测试")
     
-    # 测试命令
+    # ==================== 测试命令 ====================
     test_parser = subparsers.add_parser("test", help="测试模型")
     test_parser.add_argument("--config", type=str, default=None, help="配置文件路径")
     test_parser.add_argument("--checkpoint", type=str, required=True, help="模型检查点路径")
     test_parser.add_argument("--data_dir", type=str, default=None, help="预处理数据目录")
+    test_parser.add_argument("--data_format", type=str, choices=["parquet", "pickle", "auto"], default="auto")
     test_parser.add_argument("--data_mode", type=str, choices=["slice", "cell"], default=None,
                               help="数据模式: slice(切片级) 或 cell(细胞级)")
     
-    # 采样命令
+    # ==================== 采样命令 ====================
     sample_parser = subparsers.add_parser("sample", help="采样生成")
     sample_parser.add_argument("--config", type=str, default=None, help="配置文件路径")
     sample_parser.add_argument("--checkpoint", type=str, required=True, help="模型检查点路径")
@@ -347,7 +486,7 @@ def main():
     sample_parser.add_argument("--sample_mode", type=str, choices=["expr_to_pos", "pos_to_expr", "joint"])
     sample_parser.add_argument("--num_steps", type=int, default=None, help="采样步数")
     
-    # 提取 embedding 命令
+    # ==================== 提取 embedding 命令 ====================
     extract_parser = subparsers.add_parser("extract", help="提取 embedding")
     extract_parser.add_argument("--config", type=str, default=None, help="配置文件路径")
     extract_parser.add_argument("--checkpoint", type=str, required=True, help="模型检查点路径")
@@ -356,6 +495,13 @@ def main():
     extract_parser.add_argument("--extract_mode", type=str, choices=["encoder", "transformer", "all_layers"])
     extract_parser.add_argument("--max_samples", type=int, default=None, help="最大样本数")
     extract_parser.add_argument("--format", type=str, choices=["npz", "pt", "h5"], default="npz")
+    
+    # ==================== 上传到 HuggingFace ====================
+    upload_parser = subparsers.add_parser("upload", help="上传数据集到 HuggingFace Hub")
+    upload_parser.add_argument("--data_dir", "-d", type=str, required=True, help="数据目录")
+    upload_parser.add_argument("--repo_id", "-r", type=str, required=True, help="HuggingFace 仓库 ID")
+    upload_parser.add_argument("--private", action="store_true", help="设为私有仓库")
+    upload_parser.add_argument("--token", type=str, default=None, help="HuggingFace API token")
     
     args = parser.parse_args()
     
@@ -366,6 +512,8 @@ def main():
     # 执行命令
     if args.command == "preprocess":
         cmd_preprocess(args)
+    elif args.command == "preprocess2":
+        cmd_preprocess2(args)
     elif args.command == "train":
         cmd_train(args)
     elif args.command == "test":
@@ -374,6 +522,8 @@ def main():
         cmd_sample(args)
     elif args.command == "extract":
         cmd_extract(args)
+    elif args.command == "upload":
+        cmd_upload(args)
 
 
 if __name__ == "__main__":

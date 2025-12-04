@@ -361,11 +361,11 @@ class NoiseModel:
             # 采样噪声
             noise_expr = torch.randn_like(z_t.noisy_expression) * node_mask.unsqueeze(-1)
             
-            # 计算噪声系数
-            sigma_t = self.get_sigma_bar(t_int=t_int, key="expr")
-            sigma_s = self.get_sigma_bar(t_int=s_int, key="expr")
+            # 计算噪声系数 σ²_{t→s} = σ_t² - σ_s² * (α_t/α_s)²
+            sigma_t_sq = self.get_sigma_bar(t_int=t_int, key="expr") ** 2
+            sigma_s_sq = self.get_sigma_bar(t_int=s_int, key="expr") ** 2
             alpha_ts_sq = self.get_alpha_ts_sq(s_int=s_int, t_int=t_int, key="expr")
-            sigma2_t_s = sigma_t - sigma_s * alpha_ts_sq
+            sigma2_t_s = sigma_t_sq - sigma_s_sq * alpha_ts_sq
             noise_prefactor = torch.sqrt(torch.clamp(sigma2_t_s * sigma_sq_ratio, min=0))
             noise_prefactor = noise_prefactor.view(-1, 1, 1)  # (B, 1, 1)
             
@@ -388,11 +388,11 @@ class NoiseModel:
             noise_pos = torch.randn_like(z_t.noisy_positions) * node_mask.unsqueeze(-1)
             noise_pos = remove_mean_with_mask(noise_pos, node_mask)
             
-            # 计算噪声系数
-            sigma_t = self.get_sigma_bar(t_int=t_int, key="pos")
-            sigma_s = self.get_sigma_bar(t_int=s_int, key="pos")
+            # 计算噪声系数 σ²_{t→s} = σ_t² - σ_s² * (α_t/α_s)²
+            sigma_t_sq = self.get_sigma_bar(t_int=t_int, key="pos") ** 2
+            sigma_s_sq = self.get_sigma_bar(t_int=s_int, key="pos") ** 2
             alpha_ts_sq = self.get_alpha_ts_sq(s_int=s_int, t_int=t_int, key="pos")
-            sigma2_t_s = sigma_t - sigma_s * alpha_ts_sq
+            sigma2_t_s = sigma_t_sq - sigma_s_sq * alpha_ts_sq
             noise_prefactor = torch.sqrt(torch.clamp(sigma2_t_s * sigma_sq_ratio, min=0))
             noise_prefactor = noise_prefactor.view(-1, 1, 1)  # (B, 1, 1)
             
