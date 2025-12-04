@@ -57,34 +57,33 @@ python -c "from alphastomics.diffusion_model import MaskedDiffusionModule; print
 
 ```bash
 # 1. 预处理数据（h5ad → parquet）
-python -m alphastomics.main preprocess2 \\
-    --input_dir ./raw_h5ad \\
-    --output_dir ./processed_data \\
-    --gene_list_file ./gene_list.txt \\
-    --train_ratio 0.8 \\
-    --val_ratio 0.1
+python -m alphastomics.main preprocess \
+    --input_dir ./raw_h5ad \
+    --output_dir ./processed_data \
+    --gene_list_file ./gene_list.txt \
+    --seed 42
 
 # 2. 训练模型
-python -m alphastomics.main train \\
-    --config ./config.yaml \\
-    --data_dir ./processed_data \\
-    --batch_size 64
+python -m alphastomics.main train \
+    --config ./config.yaml \
+    --data_dir ./processed_data \
+    --batch_size 1024
 
 # 3. 测试模型
-python -m alphastomics.main test \\
-    --checkpoint ./checkpoints/best.ckpt \\
+python -m alphastomics.main test \
+    --checkpoint ./checkpoints/best.ckpt \
     --data_dir ./processed_data
 
 # 4. 采样生成
-python -m alphastomics.main sample \\
-    --checkpoint ./checkpoints/best.ckpt \\
-    --input_data ./test_input.pt \\
+python -m alphastomics.main sample \
+    --checkpoint ./checkpoints/best.ckpt \
+    --input_data ./test_input.pt \
     --sample_mode joint
 
 # 5. 提取 embedding
-python -m alphastomics.main extract \\
-    --checkpoint ./checkpoints/best.ckpt \\
-    --data_dir ./processed_data \\
+python -m alphastomics.main extract \
+    --checkpoint ./checkpoints/best.ckpt \
+    --data_dir ./processed_data \
     --output ./embeddings.npz
 ```
 
@@ -107,13 +106,14 @@ alphaStomics/
 │   │   ├── transformer.py      # Transformer 编码器
 │   │   ├── self_attention.py   # 多头注意力
 │   │   └── layers.py           # 基础层
-│   ├── preprocessing/          # 数据预处理
+│   ├── preprocessing/          # 数据预处理（推荐）
 │   │   ├── preprocess.py       # 两阶段预处理器
-│   │   ├── batch_loader.py     # 数据加载器
+│   │   ├── batch_loader.py     # Parquet 数据加载器
 │   │   └── upload_to_hf.py     # HuggingFace 上传
 │   └── utils/                  # 工具函数
-│       ├── dataloader.py       # 旧版数据加载
+│       ├── seed.py             # 随机种子管理
 │       ├── dataholder.py       # 数据容器
+│       ├── metrics.py          # 评估指标
 │       └── embedding_extractor.py
 ├── config.yaml                 # 默认配置
 ├── docs/                       # 文档
@@ -124,46 +124,87 @@ alphaStomics/
 
 ## 📋 命令行接口
 
-### 预处理命令
+### 全局参数
 
-#### `preprocess2`（推荐）- 两阶段预处理
+所有命令都支持以下全局参数：
 
 ```bash
-python -m alphastomics.main preprocess2 \\
-    --input_dir ./raw_h5ad \\        # 输入 h5ad 文件目录
-    --output_dir ./processed \\      # 输出目录
-    --gene_list_file genes.txt \\    # 固定基因列表（可选）
-    --position_key spatial \\        # 坐标字段名
-    --position_is_3d \\              # 坐标是否为 3D
-    --z_spacing 10.0 \\              # 切片间 z 间距
-    --cell_type_key cell_type \\     # 细胞类型字段名
-    --train_ratio 0.8 \\             # 训练集比例
-    --val_ratio 0.1 \\               # 验证集比例
-    --format parquet \\              # 输出格式：parquet 或 pickle
-    --max_shard_size 100000 \\       # 每个分片最大细胞数
-    --seed 42                        # 随机种子
+python -m alphastomics.main --seed 42 --deterministic <command>
 ```
 
-**两阶段处理流程**：
-1. **Stage 1**：对每个切片进行 log normalize + scale，保存中间格式
+| 参数 | 说明 |
+|------|------|
+| `--seed` | 全局随机种子，确保实验可复现（默认: 42）|
+| `--deterministic` | 启用完全确定性模式（可能降低性能）|
+
+### 预处理命令
+
+#### `preprocess` - 一步完成预处理（推荐单数据集）
+
+```bash
+python -m alphastomics.main preprocess \
+    --input_dir ./raw_h5ad \           # 输入 h5ad 文件目录
+    --output_dir ./processed \          # 输出目录
+    --gene_list_file genes.txt \        # 固定基因列表（推荐）
+    --position_key spatial \            # 坐标字段名（默认: spatial）
+    --position_is_3d \                  # 坐标是否为 3D
+    --z_spacing 10.0 \                  # 切片间 z 间距（2D 时使用）
+    --cell_type_key cell_type \         # 细胞类型字段（可选，预训练不需要）
+    --skip-log-normalize \              # 跳过 log normalize（数据已处理时）
+    --skip-scale \                      # 跳过 scale
+    --train_ratio 0.8 \                 # 训练集比例
+    --val_ratio 0.1 \                   # 验证集比例
+    --max_shard_size 100000             # 每个分片最大细胞数
+```
+
+#### `stage1` + `stage2` - 分步预处理（适合多数据集合并）
+
+**场景**：不同数据集需要不同的预处理参数（如有的需要 log normalize，有的不需要）
+
+```bash
+# 数据集 A：需要 log normalize
+python -m alphastomics.main stage1 \
+    --input_dir ./dataset_A \
+    --output_dir ./intermediate/A \
+    --gene_list_file genes.txt          # 必须使用相同的基因列表！
+
+# 数据集 B：已经 log normalized，跳过
+python -m alphastomics.main stage1 \
+    --input_dir ./dataset_B \
+    --output_dir ./intermediate/B \
+    --gene_list_file genes.txt \
+    --skip-log-normalize
+
+# 合并所有数据集，生成最终 Parquet
+python -m alphastomics.main stage2 \
+    --input_dirs ./intermediate/A ./intermediate/B \
+    --output_dir ./final_dataset \
+    --train_ratio 0.8 \
+    --val_ratio 0.1
+```
+
+**⚠️ 重要**：合并多数据集时，所有 `stage1` 必须使用**相同的基因列表文件**！
+
+**预处理流程**：
+1. **Stage 1**：对每个切片进行 log normalize + scale（可选），保存中间格式
 2. **Stage 2**：跨切片随机采样，生成 train/val/test 分割，序列化为 Parquet
 
 **特点**：
-- 内存友好：不需要一次性加载所有数据
+- 内存友好：流式处理，不需要一次性加载所有数据
 - 无放回采样：每个细胞恰好出现一次
 - 细胞级分割：同一切片可能被分到不同集合
+- 基因补全：缺失基因自动补 0
 
 ### 训练命令
 
 ```bash
-python -m alphastomics.main train \\
-    --config ./config.yaml \\        # 配置文件
-    --data_dir ./processed \\        # 数据目录
-    --data_format auto \\            # 数据格式：auto/parquet/pickle
-    --batch_size 64 \\               # 批次大小
-    --streaming \\                   # 流式加载（大数据集推荐）
-    --buffer_size 50000 \\           # shuffle buffer 大小
-    --resume ./checkpoint.ckpt \\    # 恢复训练
+python -m alphastomics.main train \
+    --config ./config.yaml \         # 配置文件
+    --data_dir ./processed \         # 数据目录
+    --batch_size 1024 \              # 批次大小
+    --streaming \                    # 流式加载（大数据集推荐）
+    --buffer_size 50000 \            # shuffle buffer 大小
+    --resume ./checkpoint.ckpt \     # 恢复训练
     --test_after_train               # 训练后自动测试
 ```
 
@@ -198,7 +239,7 @@ adata.X                    # 基因表达矩阵 (n_cells, n_genes)
 adata.obsm['spatial']      # 空间坐标 (n_cells, 2) 或 (n_cells, 3)
 
 # 可选字段
-adata.obs['cell_type']     # 细胞类型标签
+adata.obs['cell_type']     # 细胞类型标签（预训练时不需要）
 adata.var_names            # 基因名称
 ```
 
@@ -206,15 +247,12 @@ adata.var_names            # 基因名称
 
 ```
 processed_data/
-├── train/
-│   ├── shard_0000.parquet
-│   ├── shard_0001.parquet
-│   └── ...
-├── val/
-│   └── shard_0000.parquet
-├── test/
-│   └── shard_0000.parquet
-└── metadata.json          # 基因列表、统计信息
+├── data/
+│   ├── train.parquet          # 或 train-00000.parquet, train-00001.parquet, ...
+│   ├── validation.parquet
+│   └── test.parquet
+├── metadata.json              # 基因列表、统计信息
+└── _intermediate_slices/      # 中间文件（可删除）
 ```
 
 每个 Parquet 文件包含：
@@ -229,6 +267,12 @@ processed_data/
 
 ```yaml
 # config.yaml
+
+# 随机种子（确保可复现）
+seed:
+  global_seed: 42
+  deterministic: false    # true 会降低性能但保证完全复现
+
 model:
   num_genes: 20000           # 基因数量
   d_model: 256               # 模型维度
@@ -243,7 +287,7 @@ diffusion:
 
 training:
   mode: joint                # 训练模式：joint/expr_to_pos/pos_to_expr
-  batch_size: 64
+  batch_size: 1024
   learning_rate: 1e-4
   max_epochs: 100
 
@@ -254,8 +298,10 @@ masking:
 
 data:
   processed_data_dir: ./processed
+  preprocessing:
+    normalize_position: false  # 不对坐标归一化（保持原始 CCF）
+    scale: true
   loading:
-    max_cells: 5000          # 每批最大细胞数
     num_workers: 4
 ```
 
@@ -372,12 +418,14 @@ $$\mathcal{L}_{pos} = \frac{1}{N^2} \sum_{i,j} (D_{true}^{(i,j)} - D_{pred}^{(i,
 | 模块 | LUNA | AlphaSTomics | 改进说明 |
 |------|------|--------------|---------|
 | **坐标维度** | 2D | 3D CCF | 支持配准后的三维空间数据 |
+| **坐标处理** | 归一化到 [-0.5, 0.5] | 保持原始坐标 | 不丢失坐标信息，可直接使用 |
 | **扩散模态** | 仅位置 | 表达量 + 位置 | 双模态联合扩散 |
-| **基因选择** | 高变异基因 | 全基因 | 支持多平台数据统一 |
+| **基因选择** | 高变异基因 | 全基因（固定列表） | 支持多平台数据统一，缺失补 0 |
 | **注意力** | Linear Attention | Linear Attention | O(n²) → O(n) |
 | **采样模式** | 单向 | 双向 + 联合 | 更灵活的生成能力 |
 | **分布式** | 不支持 | DDP/FSDP/DeepSpeed | 多机多卡训练 |
 | **数据格式** | 内存加载 | Parquet 流式 | 支持大规模数据集 |
+| **可复现性** | 无 | 全局种子控制 | 完全可复现的实验 |
 
 ---
 
