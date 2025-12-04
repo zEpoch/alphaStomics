@@ -487,30 +487,34 @@ class Stage2BatchGenerator:
     
     def process(
         self,
-        input_dir: str,
+        input_dir: Union[str, List[str]],
         output_dir: str,
         output_format: str = "parquet",  # "parquet", "pickle"
     ) -> Dict:
         """
-        生成数据集
+        生成数据集（支持多目录合并）
         
         Args:
-            input_dir: 阶段一输出目录
+            input_dir: 阶段一输出目录，可以是单个路径或多个路径的列表
             output_dir: 输出目录
             output_format: 输出格式 ("parquet" 推荐用于 HuggingFace)
         
         Returns:
             生成统计信息
         """
-        input_dir = Path(input_dir)
+        # 支持多目录输入
+        if isinstance(input_dir, str):
+            input_dirs = [Path(input_dir)]
+        else:
+            input_dirs = [Path(d) for d in input_dir]
+        
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # 加载元数据
-        with open(input_dir / 'metadata.pkl', 'rb') as f:
-            metadata = pickle.load(f)
+        # 加载并合并元数据
+        metadata = self._load_and_merge_metadata(input_dirs)
         
-        logger.info(f"元数据: {metadata['n_slices']} 切片, {metadata['total_cells']} 细胞")
+        logger.info(f"合并后元数据: {metadata['n_slices']} 切片, {metadata['total_cells']} 细胞")
         
         # ===== 第一步：构建全局细胞索引 =====
         logger.info("第一步：构建全局细胞索引...")
@@ -563,6 +567,88 @@ class Stage2BatchGenerator:
         
         logger.info(f"阶段二完成！输出目录: {output_dir}")
         return stats
+    
+    def _load_and_merge_metadata(self, input_dirs: List[Path]) -> Dict:
+        """
+        加载并合并多个目录的元数据
+        
+        Args:
+            input_dirs: Stage1 输出目录列表
+            
+        Returns:
+            合并后的元数据
+        """
+        all_metadata = []
+        for input_dir in input_dirs:
+            meta_path = input_dir / 'metadata.pkl'
+            if not meta_path.exists():
+                raise FileNotFoundError(f"未找到元数据文件: {meta_path}")
+            
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+            all_metadata.append(meta)
+            logger.info(f"加载 {input_dir}: {meta['n_slices']} 切片, {meta['total_cells']} 细胞")
+        
+        if len(all_metadata) == 1:
+            return all_metadata[0]
+        
+        # 合并多个元数据
+        merged = {
+            'n_slices': 0,
+            'total_cells': 0,
+            'n_genes': all_metadata[0]['n_genes'],
+            'gene_names': all_metadata[0]['gene_names'],
+            'n_cell_types': 0,
+            'cell_type_mapping': {},
+            'slices': [],
+            'position_key': all_metadata[0].get('position_key', 'spatial'),
+            'position_is_3d': all_metadata[0].get('position_is_3d', False),
+        }
+        
+        # 验证基因列表一致性
+        ref_genes = set(all_metadata[0]['gene_names'])
+        for i, meta in enumerate(all_metadata[1:], 1):
+            if set(meta['gene_names']) != ref_genes:
+                logger.warning(f"警告: 目录 {i} 的基因列表与目录 0 不一致！")
+                logger.warning(f"  目录 0: {len(ref_genes)} 个基因")
+                logger.warning(f"  目录 {i}: {len(meta['gene_names'])} 个基因")
+                # 检查是否顺序也一致
+                if meta['gene_names'] != all_metadata[0]['gene_names']:
+                    raise ValueError(
+                        f"基因列表不一致！请确保所有 Stage1 使用相同的 gene_list_file。"
+                        f"\n目录 0 基因数: {len(all_metadata[0]['gene_names'])}"
+                        f"\n目录 {i} 基因数: {len(meta['gene_names'])}"
+                    )
+        
+        # 合并细胞类型映射
+        all_cell_types = set()
+        for meta in all_metadata:
+            if meta.get('cell_type_mapping'):
+                all_cell_types.update(meta['cell_type_mapping'].keys())
+        
+        if all_cell_types:
+            merged['cell_type_mapping'] = {ct: i for i, ct in enumerate(sorted(all_cell_types))}
+            merged['n_cell_types'] = len(merged['cell_type_mapping'])
+        
+        # 合并切片，重新编号 slice_idx
+        global_slice_idx = 0
+        for meta in all_metadata:
+            for slice_info in meta['slices']:
+                new_slice_info = slice_info.copy()
+                new_slice_info['slice_idx'] = global_slice_idx
+                # 如果细胞类型映射有变化，需要更新
+                if meta.get('cell_type_mapping') and merged['cell_type_mapping']:
+                    new_slice_info['_old_cell_type_mapping'] = meta['cell_type_mapping']
+                merged['slices'].append(new_slice_info)
+                merged['total_cells'] += slice_info['n_cells']
+                global_slice_idx += 1
+        
+        merged['n_slices'] = global_slice_idx
+        
+        logger.info(f"合并完成: {merged['n_slices']} 切片, {merged['total_cells']} 细胞, "
+                   f"{merged['n_genes']} 基因, {merged['n_cell_types']} 细胞类型")
+        
+        return merged
     
     def _build_cell_index(self, metadata: Dict) -> np.ndarray:
         """

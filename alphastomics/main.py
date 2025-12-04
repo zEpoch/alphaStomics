@@ -70,6 +70,9 @@ def cmd_preprocess(args):
     do_log_normalize = not getattr(args, 'skip_log_normalize', False)
     do_scale = not getattr(args, 'skip_scale', False)
     
+    # 细胞类型 key（可选）
+    cell_type_key = getattr(args, 'cell_type_key', None) or preprocess_cfg.get("cell_type_key")
+    
     # ===== 阶段一：切片预处理 =====
     logger.info("")
     if do_log_normalize:
@@ -83,7 +86,7 @@ def cmd_preprocess(args):
         position_key=args.position_key or preprocess_cfg.get("position_key", "spatial"),
         position_is_3d=getattr(args, 'position_is_3d', False) or preprocess_cfg.get("position_is_3d", False),
         z_spacing=args.z_spacing or preprocess_cfg.get("z_spacing", 10.0),
-        cell_type_key=getattr(args, 'cell_type_key', 'cell_type') or preprocess_cfg.get("cell_type_key", "cell_type"),
+        cell_type_key=cell_type_key,  # 可选，None 表示不处理细胞类型
         log_normalize=do_log_normalize,
         scale=do_scale,
         normalize_position=preprocess_cfg.get("normalize_position", False),
@@ -123,6 +126,99 @@ def cmd_preprocess(args):
     logger.info("=" * 50)
     logger.info("预处理完成!")
     logger.info(f"  输出目录: {output_dir}")
+    logger.info(f"  训练集: {stats['train']['n_cells']:,} 细胞")
+    logger.info(f"  验证集: {stats['validation']['n_cells']:,} 细胞")
+    logger.info(f"  测试集: {stats['test']['n_cells']:,} 细胞")
+    logger.info("=" * 50)
+
+
+def cmd_stage1(args):
+    """阶段一：仅切片预处理（可多次调用）"""
+    from alphastomics.preprocessing import Stage1Preprocessor
+    
+    logger.info("=" * 50)
+    logger.info("阶段一：切片预处理")
+    logger.info("=" * 50)
+    
+    # 加载配置
+    cfg = load_config(args.config) if args.config else {}
+    preprocess_cfg = cfg.get("data", {}).get("preprocessing", {})
+    
+    # 判断是否跳过 log normalize 和 scale
+    do_log_normalize = not getattr(args, 'skip_log_normalize', False)
+    do_scale = not getattr(args, 'skip_scale', False)
+    
+    # 细胞类型 key（可选）
+    cell_type_key = getattr(args, 'cell_type_key', None) or preprocess_cfg.get("cell_type_key")
+    
+    logger.info(f"Log normalize: {do_log_normalize}, Scale: {do_scale}")
+    if cell_type_key:
+        logger.info(f"细胞类型 key: {cell_type_key}")
+    else:
+        logger.info("细胞类型: 不处理（预训练模式）")
+    
+    preprocessor = Stage1Preprocessor(
+        gene_list_file=args.gene_list_file,
+        position_key=args.position_key or preprocess_cfg.get("position_key", "spatial"),
+        position_is_3d=getattr(args, 'position_is_3d', False) or preprocess_cfg.get("position_is_3d", False),
+        z_spacing=args.z_spacing or preprocess_cfg.get("z_spacing", 10.0),
+        cell_type_key=cell_type_key,  # 可选，None 表示不处理细胞类型
+        log_normalize=do_log_normalize,
+        scale=do_scale,
+        normalize_position=preprocess_cfg.get("normalize_position", False),
+    )
+    
+    # 查找 h5ad 文件
+    input_path = Path(args.input_dir)
+    h5ad_files = sorted(input_path.glob("*.h5ad"))
+    
+    if not h5ad_files:
+        raise ValueError(f"在 {args.input_dir} 中未找到 h5ad 文件")
+    
+    logger.info(f"找到 {len(h5ad_files)} 个 h5ad 文件")
+    
+    metadata = preprocessor.process(args.input_dir, args.output_dir)
+    
+    logger.info("")
+    logger.info("=" * 50)
+    logger.info("阶段一完成!")
+    logger.info(f"  输出目录: {args.output_dir}")
+    logger.info(f"  切片数: {metadata.n_slices}")
+    logger.info(f"  细胞数: {metadata.total_cells:,}")
+    logger.info(f"  基因数: {metadata.n_genes}")
+    logger.info("")
+    logger.info("提示: 可以继续处理其他数据集，最后用 stage2 合并")
+    logger.info("=" * 50)
+
+
+def cmd_stage2(args):
+    """阶段二：合并多个 Stage1 输出，生成数据集"""
+    from alphastomics.preprocessing import Stage2BatchGenerator
+    
+    logger.info("=" * 50)
+    logger.info("阶段二：合并数据集")
+    logger.info("=" * 50)
+    
+    logger.info(f"输入目录: {args.input_dirs}")
+    
+    generator = Stage2BatchGenerator(
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+        max_shard_size=args.max_shard_size,
+    )
+    
+    # 支持多目录输入
+    stats = generator.process(
+        input_dir=args.input_dirs,  # 传入列表
+        output_dir=args.output_dir,
+        output_format="parquet"
+    )
+    
+    logger.info("")
+    logger.info("=" * 50)
+    logger.info("阶段二完成!")
+    logger.info(f"  输出目录: {args.output_dir}")
     logger.info(f"  训练集: {stats['train']['n_cells']:,} 细胞")
     logger.info(f"  验证集: {stats['validation']['n_cells']:,} 细胞")
     logger.info(f"  测试集: {stats['test']['n_cells']:,} 细胞")
@@ -383,7 +479,7 @@ def main():
     
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
     
-    # ==================== 预处理命令 ====================
+    # ==================== 预处理命令（一步完成） ====================
     preprocess_parser = subparsers.add_parser("preprocess", help="预处理 h5ad 数据（两阶段，Parquet 输出）")
     preprocess_parser.add_argument("--input_dir", "-i", type=str, required=True, help="输入 h5ad 文件目录")
     preprocess_parser.add_argument("--output_dir", "-o", type=str, required=True, help="输出数据目录")
@@ -392,7 +488,8 @@ def main():
     preprocess_parser.add_argument("--position_key", type=str, default="spatial", help="坐标 key")
     preprocess_parser.add_argument("--position_is_3d", action="store_true", help="坐标是否为 3D")
     preprocess_parser.add_argument("--z_spacing", type=float, default=10.0, help="切片间 z 间距")
-    preprocess_parser.add_argument("--cell_type_key", type=str, default="cell_type", help="细胞类型 key")
+    preprocess_parser.add_argument("--cell_type_key", type=str, default=None, 
+                                   help="细胞类型 key（可选，预训练时不需要）")
     preprocess_parser.add_argument("--skip-log-normalize", action="store_true", dest="skip_log_normalize",
                                    help="跳过 log normalize（数据已预处理时使用）")
     preprocess_parser.add_argument("--skip-scale", action="store_true", dest="skip_scale",
@@ -400,6 +497,32 @@ def main():
     preprocess_parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例")
     preprocess_parser.add_argument("--val_ratio", type=float, default=0.1, help="验证集比例")
     preprocess_parser.add_argument("--max_shard_size", type=int, default=100000, help="每个分片最大细胞数")
+    
+    # ==================== Stage1: 仅切片预处理 ====================
+    stage1_parser = subparsers.add_parser("stage1", help="阶段一：仅切片预处理（可多次调用处理不同数据集）")
+    stage1_parser.add_argument("--input_dir", "-i", type=str, required=True, help="输入 h5ad 文件目录")
+    stage1_parser.add_argument("--output_dir", "-o", type=str, required=True, help="输出中间数据目录")
+    stage1_parser.add_argument("--config", type=str, default=None, help="配置文件路径")
+    stage1_parser.add_argument("--gene_list_file", "-g", type=str, required=True, 
+                               help="固定基因列表文件（合并多数据集时必须）")
+    stage1_parser.add_argument("--position_key", type=str, default="spatial", help="坐标 key")
+    stage1_parser.add_argument("--position_is_3d", action="store_true", help="坐标是否为 3D")
+    stage1_parser.add_argument("--z_spacing", type=float, default=10.0, help="切片间 z 间距")
+    stage1_parser.add_argument("--cell_type_key", type=str, default=None, 
+                               help="细胞类型 key（可选，预训练时不需要）")
+    stage1_parser.add_argument("--skip-log-normalize", action="store_true", dest="skip_log_normalize",
+                               help="跳过 log normalize（数据已预处理时使用）")
+    stage1_parser.add_argument("--skip-scale", action="store_true", dest="skip_scale",
+                               help="跳过 scale（z-score 标准化）")
+    
+    # ==================== Stage2: 合并生成数据集 ====================
+    stage2_parser = subparsers.add_parser("stage2", help="阶段二：合并多个 Stage1 输出，生成 Parquet 数据集")
+    stage2_parser.add_argument("--input_dirs", "-i", type=str, nargs='+', required=True,
+                               help="Stage1 输出目录（可指定多个）")
+    stage2_parser.add_argument("--output_dir", "-o", type=str, required=True, help="输出数据目录")
+    stage2_parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例")
+    stage2_parser.add_argument("--val_ratio", type=float, default=0.1, help="验证集比例")
+    stage2_parser.add_argument("--max_shard_size", type=int, default=100000, help="每个分片最大细胞数")
     
     # ==================== 训练命令 ====================
     train_parser = subparsers.add_parser("train", help="训练模型")
@@ -462,6 +585,10 @@ def main():
     # 执行命令
     if args.command == "preprocess":
         cmd_preprocess(args)
+    elif args.command == "stage1":
+        cmd_stage1(args)
+    elif args.command == "stage2":
+        cmd_stage2(args)
     elif args.command == "train":
         cmd_train(args)
     elif args.command == "test":
