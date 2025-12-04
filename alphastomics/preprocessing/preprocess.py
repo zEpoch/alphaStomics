@@ -96,6 +96,7 @@ class Stage1Preprocessor:
         position_is_3d: bool = False,
         z_spacing: float = 10.0,
         cell_type_key: Optional[str] = 'cell_type',
+        log_normalize: bool = True,
         scale: bool = True,
         normalize_position: bool = False,
         target_sum: float = 1e4,
@@ -108,6 +109,7 @@ class Stage1Preprocessor:
             position_is_3d: 坐标是否已经是 3D
             z_spacing: 切片间 z 间距（仅 2D 时使用）
             cell_type_key: obs 中细胞类型的 key
+            log_normalize: 是否做 log normalize（如果数据已经做过可设为 False）
             scale: 是否做 z-score 标准化
             normalize_position: 是否标准化坐标
             target_sum: normalize_total 的目标值
@@ -118,6 +120,7 @@ class Stage1Preprocessor:
         self.position_is_3d = position_is_3d
         self.z_spacing = z_spacing
         self.cell_type_key = cell_type_key
+        self.log_normalize = log_normalize
         self.scale = scale
         self.normalize_position = normalize_position
         self.target_sum = target_sum
@@ -348,9 +351,10 @@ class Stage1Preprocessor:
         if genes_in_data:
             adata_subset = adata[:, genes_in_data].copy()
             
-            # Log normalize（每片独立）
-            sc.pp.normalize_total(adata_subset, target_sum=self.target_sum)
-            sc.pp.log1p(adata_subset)
+            # Log normalize（每片独立，可选）
+            if self.log_normalize:
+                sc.pp.normalize_total(adata_subset, target_sum=self.target_sum)
+                sc.pp.log1p(adata_subset)
             
             # Scale（可选）
             if self.scale:

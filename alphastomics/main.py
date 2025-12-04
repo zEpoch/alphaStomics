@@ -66,9 +66,16 @@ def cmd_preprocess(args):
     output_dir = Path(args.output_dir)
     intermediate_dir = output_dir / '_intermediate_slices'
     
+    # 判断是否跳过 log normalize 和 scale
+    do_log_normalize = not getattr(args, 'skip_log_normalize', False)
+    do_scale = not getattr(args, 'skip_scale', False)
+    
     # ===== 阶段一：切片预处理 =====
     logger.info("")
-    logger.info("阶段一：切片预处理 (log normalize + scale)")
+    if do_log_normalize:
+        logger.info("阶段一：切片预处理 (log normalize + scale)")
+    else:
+        logger.info("阶段一：切片预处理 (跳过 log normalize)")
     logger.info("-" * 40)
     
     preprocessor = Stage1Preprocessor(
@@ -77,7 +84,8 @@ def cmd_preprocess(args):
         position_is_3d=getattr(args, 'position_is_3d', False) or preprocess_cfg.get("position_is_3d", False),
         z_spacing=args.z_spacing or preprocess_cfg.get("z_spacing", 10.0),
         cell_type_key=getattr(args, 'cell_type_key', 'cell_type') or preprocess_cfg.get("cell_type_key", "cell_type"),
-        scale=preprocess_cfg.get("scale", True),
+        log_normalize=do_log_normalize,
+        scale=do_scale,
         normalize_position=preprocess_cfg.get("normalize_position", False),
     )
     
@@ -89,6 +97,7 @@ def cmd_preprocess(args):
         raise ValueError(f"在 {args.input_dir} 中未找到 h5ad 文件")
     
     logger.info(f"找到 {len(h5ad_files)} 个 h5ad 文件")
+    logger.info(f"Log normalize: {do_log_normalize}, Scale: {do_scale}")
     
     stage1_metadata = preprocessor.process(args.input_dir, str(intermediate_dir))
     
@@ -384,6 +393,10 @@ def main():
     preprocess_parser.add_argument("--position_is_3d", action="store_true", help="坐标是否为 3D")
     preprocess_parser.add_argument("--z_spacing", type=float, default=10.0, help="切片间 z 间距")
     preprocess_parser.add_argument("--cell_type_key", type=str, default="cell_type", help="细胞类型 key")
+    preprocess_parser.add_argument("--skip-log-normalize", action="store_true", dest="skip_log_normalize",
+                                   help="跳过 log normalize（数据已预处理时使用）")
+    preprocess_parser.add_argument("--skip-scale", action="store_true", dest="skip_scale",
+                                   help="跳过 scale（z-score 标准化）")
     preprocess_parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例")
     preprocess_parser.add_argument("--val_ratio", type=float, default=0.1, help="验证集比例")
     preprocess_parser.add_argument("--max_shard_size", type=int, default=100000, help="每个分片最大细胞数")
