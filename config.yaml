@@ -46,7 +46,7 @@ training:
   weight_decay: 1e-5
   batch_size: 32
   epochs: 100
-  precision: "16-mixed"          # 训练精度: "32", "16-mixed", "bf16-mixed"
+  precision: "bf16-mixed"          # 训练精度: "32", "16-mixed", "bf16-mixed"
   gradient_clip_val: 1.0         # 梯度裁剪
   accumulate_grad_batches: 1     # 梯度累积
   early_stopping: true           # 是否早停
@@ -127,7 +127,7 @@ data:
     z_spacing: 1.0                # 切片间的 z 间距（仅当 position_is_3d=false 时使用）
     cell_type_key: "cell_type"    # 细胞类型的 key
     scale: true                   # 是否进行表达量 scale
-    normalize_position: true      # 是否标准化坐标
+    normalize_position: false     # 是否标准化坐标（false=保持原始CCF坐标）
   
   # 数据加载参数
   loading:

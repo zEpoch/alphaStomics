@@ -97,7 +97,7 @@ class Stage1Preprocessor:
         z_spacing: float = 10.0,
         cell_type_key: Optional[str] = 'cell_type',
         scale: bool = True,
-        normalize_position: bool = True,
+        normalize_position: bool = False,
         target_sum: float = 1e4,
         max_scale_value: float = 10.0,
     ):

@@ -1,19 +1,27 @@
 """
-数据加载和预处理模块
-支持从多个 h5ad 文件加载 3D 空间转录组切片数据
+数据加载和预处理模块（已弃用）
 
-两种训练模式:
-1. 切片级别 (slice-level): 每次输入一整张切片
-2. 细胞级别 (cell-level): 每次采样 batch_size 个细胞
+⚠️ 警告: 此模块已弃用，将在未来版本中移除。
+请使用新的预处理模块:
+    from alphastomics.preprocessing import (
+        Stage1Preprocessor,  # 替代 SpatialDataPreprocessor
+        Stage2BatchGenerator,
+        create_dataloaders,  # 统一的数据加载器
+    )
 
-预处理流程:
-1. 加载 h5ad 文件
-2. 基因筛选（高变异基因）
-3. Log normalize + Scale
-4. 坐标标准化
-5. 保存预处理结果
+旧功能:
+- 支持从多个 h5ad 文件加载 3D 空间转录组切片数据
+- 切片级别 (slice-level) 和 细胞级别 (cell-level) 训练模式
+- 预处理流程: 加载 h5ad -> 基因筛选 -> Log normalize + Scale -> 坐标标准化
+
+新功能 (preprocessing 模块):
+- 两阶段预处理 (Stage1 + Stage2)
+- Parquet 格式存储，内存友好
+- 支持 HuggingFace Hub 上传和流式加载
+- 更好的随机种子控制
 """
 import os
+import warnings
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -25,6 +33,14 @@ import logging
 import h5py
 
 logger = logging.getLogger(__name__)
+
+# 发出弃用警告
+warnings.warn(
+    "alphastomics.utils.dataloader 模块已弃用，将在 v2.0 中移除。"
+    "请使用 alphastomics.preprocessing 模块替代。",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 
 # ==================== 预处理器 ====================
@@ -52,7 +68,7 @@ class SpatialDataPreprocessor:
         z_spacing: float = 1.0,
         cell_type_key: Optional[str] = 'cell_type',
         scale: bool = True,
-        normalize_position: bool = True,
+        normalize_position: bool = False,
     ):
         """
         Args:
