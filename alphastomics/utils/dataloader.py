@@ -545,6 +545,7 @@ def create_slice_dataloaders(
     val_ratio: float = 0.1,
     num_workers: int = 4,
     shuffle_train: bool = True,
+    seed: int = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
     """
     创建切片级别的数据加载器
@@ -556,18 +557,26 @@ def create_slice_dataloaders(
         val_ratio: 验证集比例
         num_workers: 工作线程数
         shuffle_train: 是否打乱训练数据
+        seed: 随机种子（用于数据集划分）
     
     Returns:
         (train_loader, val_loader, test_loader, metadata)
     """
+    from alphastomics.utils.seed import worker_init_fn, get_generator, get_seed
+    
     # 加载元数据
     with open(Path(data_dir) / 'metadata.pkl', 'rb') as f:
         metadata = pickle.load(f)
     
     n_slices = metadata['n_slices']
     
-    # 划分切片索引
-    indices = np.random.permutation(n_slices)
+    # 获取随机种子
+    if seed is None:
+        seed = get_seed() or 42
+    
+    # 使用固定种子进行数据集划分（确保可复现）
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(n_slices)
     n_train = int(n_slices * train_ratio)
     n_val = int(n_slices * val_ratio)
     
@@ -582,6 +591,9 @@ def create_slice_dataloaders(
     val_dataset = SliceLevelDataset(data_dir, val_indices)
     test_dataset = SliceLevelDataset(data_dir, test_indices)
     
+    # 创建 generator
+    generator = get_generator(seed)
+    
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
@@ -590,6 +602,8 @@ def create_slice_dataloaders(
         num_workers=num_workers,
         collate_fn=slice_collate_fn,
         pin_memory=True,
+        generator=generator,
+        worker_init_fn=worker_init_fn,
     )
     
     val_loader = DataLoader(
@@ -599,6 +613,7 @@ def create_slice_dataloaders(
         num_workers=num_workers,
         collate_fn=slice_collate_fn,
         pin_memory=True,
+        worker_init_fn=worker_init_fn,
     )
     
     test_loader = DataLoader(
@@ -608,6 +623,7 @@ def create_slice_dataloaders(
         num_workers=num_workers,
         collate_fn=slice_collate_fn,
         pin_memory=True,
+        worker_init_fn=worker_init_fn,
     )
     
     return train_loader, val_loader, test_loader, metadata
@@ -620,6 +636,7 @@ def create_cell_dataloaders(
     val_ratio: float = 0.1,
     num_workers: int = 4,
     shuffle_train: bool = True,
+    seed: int = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
     """
     创建细胞级别的数据加载器
@@ -631,18 +648,26 @@ def create_cell_dataloaders(
         val_ratio: 验证集比例
         num_workers: 工作线程数
         shuffle_train: 是否打乱训练数据
+        seed: 随机种子（用于数据集划分）
     
     Returns:
         (train_loader, val_loader, test_loader, metadata)
     """
+    from alphastomics.utils.seed import worker_init_fn, get_generator, get_seed
+    
     # 加载元数据
     with open(Path(data_dir) / 'metadata.pkl', 'rb') as f:
         metadata = pickle.load(f)
     
     n_slices = metadata['n_slices']
     
-    # 按切片划分（保证同一切片的细胞在同一集合）
-    indices = np.random.permutation(n_slices)
+    # 获取随机种子
+    if seed is None:
+        seed = get_seed() or 42
+    
+    # 使用固定种子进行数据集划分（确保可复现）
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(n_slices)
     n_train = int(n_slices * train_ratio)
     n_val = int(n_slices * val_ratio)
     
@@ -659,6 +684,9 @@ def create_cell_dataloaders(
     
     logger.info(f"细胞划分: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
     
+    # 创建 generator
+    generator = get_generator(seed)
+    
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
@@ -668,6 +696,8 @@ def create_cell_dataloaders(
         collate_fn=cell_collate_fn,
         pin_memory=True,
         drop_last=True,  # 丢弃最后不完整的 batch
+        generator=generator,
+        worker_init_fn=worker_init_fn,
     )
     
     val_loader = DataLoader(
@@ -677,6 +707,7 @@ def create_cell_dataloaders(
         num_workers=num_workers,
         collate_fn=cell_collate_fn,
         pin_memory=True,
+        worker_init_fn=worker_init_fn,
     )
     
     test_loader = DataLoader(
@@ -686,6 +717,7 @@ def create_cell_dataloaders(
         num_workers=num_workers,
         collate_fn=cell_collate_fn,
         pin_memory=True,
+        worker_init_fn=worker_init_fn,
     )
     
     return train_loader, val_loader, test_loader, metadata

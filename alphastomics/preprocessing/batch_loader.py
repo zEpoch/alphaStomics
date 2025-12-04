@@ -289,6 +289,7 @@ def create_dataloaders(
     streaming: bool = False,
     buffer_size: int = 10000,
     pin_memory: bool = True,
+    seed: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict]:
     """
     创建 DataLoader
@@ -300,11 +301,21 @@ def create_dataloaders(
         streaming: 是否流式加载（大数据集推荐）
         buffer_size: 流式加载的 shuffle buffer 大小
         pin_memory: 是否固定内存
+        seed: 随机种子（用于 DataLoader 的 generator 和 worker_init_fn）
     
     Returns:
         (train_loader, val_loader, test_loader, metadata)
     """
+    from alphastomics.utils.seed import worker_init_fn, get_generator, get_seed
+    
     data_dir = Path(data_dir)
+    
+    # 获取随机种子
+    if seed is None:
+        seed = get_seed() or 42
+    
+    # 创建 generator（用于 shuffle）
+    generator = get_generator(seed)
     
     # 加载元数据
     metadata = {}
@@ -363,6 +374,8 @@ def create_dataloaders(
             collate_fn=cell_collate_fn,
             pin_memory=pin_memory,
             drop_last=True,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -371,6 +384,7 @@ def create_dataloaders(
             num_workers=num_workers,
             collate_fn=cell_collate_fn,
             pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
         )
         test_loader = DataLoader(
             test_dataset,
@@ -379,6 +393,7 @@ def create_dataloaders(
             num_workers=num_workers,
             collate_fn=cell_collate_fn,
             pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
         )
     
     return train_loader, val_loader, test_loader, metadata

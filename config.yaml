@@ -1,6 +1,13 @@
 # AlphaSTomics 配置文件
 # 双模态扩散模型：表达量 + 3D坐标
 
+# ==================== 随机种子设置 ====================
+# 设置随机种子确保实验可复现
+seed:
+  value: 42                      # 随机种子值
+  deterministic: true            # 是否启用确定性模式（可能降低性能）
+  benchmark: false               # 是否启用 cuDNN benchmark（提升性能但降低复现性）
+
 # ==================== 训练模式 ====================
 # 可选: "expr_to_pos", "pos_to_expr", "joint"
 training_mode: "joint"

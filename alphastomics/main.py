@@ -22,6 +22,11 @@ AlphaSTomics - 双模态空间转录组扩散模型
     
     # 提取 embedding
     python main.py extract --checkpoint ./outputs/checkpoints/last.ckpt --data_dir ./processed
+
+随机种子控制:
+    所有命令都支持 --seed 参数来设置全局随机种子，确保实验可复现：
+    python main.py train --config config.yaml --seed 42
+    python main.py preprocess2 --input_dir ./raw --output_dir ./out --seed 42
 """
 import yaml
 import argparse
@@ -29,6 +34,8 @@ import torch
 import pytorch_lightning as pl
 from pathlib import Path
 import logging
+
+from alphastomics.utils.seed import set_seed, get_seed_info
 
 logging.basicConfig(
     level=logging.INFO,
@@ -427,6 +434,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     
+    # ==================== 全局参数 ====================
+    parser.add_argument("--seed", type=int, default=42, 
+                        help="全局随机种子，用于确保实验可复现 (默认: 42)")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="启用确定性模式（可能降低性能，但保证完全复现）")
+    
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
     
     # ==================== 预处理命令（旧版）====================
@@ -452,7 +465,7 @@ def main():
     preprocess2_parser.add_argument("--val_ratio", type=float, default=0.1, help="验证集比例")
     preprocess2_parser.add_argument("--format", choices=["parquet", "pickle"], default="parquet", help="输出格式")
     preprocess2_parser.add_argument("--max_shard_size", type=int, default=100000, help="每个分片最大细胞数")
-    preprocess2_parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    # 注意：preprocess2 有自己的 --seed 参数，会被全局 --seed 覆盖
     
     # ==================== 训练命令 ====================
     train_parser = subparsers.add_parser("train", help="训练模型")
@@ -508,6 +521,18 @@ def main():
     if args.command is None:
         parser.print_help()
         return
+    
+    # ==================== 设置全局随机种子 ====================
+    set_seed(
+        seed=args.seed,
+        deterministic=args.deterministic,
+        benchmark=not args.deterministic,  # 非确定性模式下启用 benchmark 提升性能
+    )
+    logger.info(f"随机种子设置信息: {get_seed_info()}")
+    
+    # 对于 preprocess2，使用全局 seed 覆盖其参数
+    if args.command == "preprocess2":
+        args.seed = args.seed  # 使用全局 seed
     
     # 执行命令
     if args.command == "preprocess":
