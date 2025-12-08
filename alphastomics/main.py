@@ -242,8 +242,55 @@ def cmd_train(args):
     # 加载配置
     cfg = load_config(args.config)
     
+    # 用命令行参数覆盖配置
+    if args.training_mode is not None:
+        cfg['training_mode'] = args.training_mode
+    if args.batch_size is not None:
+        cfg.setdefault('training', {})['batch_size'] = args.batch_size
+    if args.epochs is not None:
+        cfg.setdefault('training', {})['epochs'] = args.epochs
+    if args.lr is not None:
+        cfg.setdefault('training', {})['learning_rate'] = args.lr
+    
+    # Gated Attention 参数
+    if args.use_gated_attention:
+        cfg.setdefault('TransformerLayer_setting', {})['use_gated_attention'] = True
+    if args.no_gated_attention:
+        cfg.setdefault('TransformerLayer_setting', {})['use_gated_attention'] = False
+    if args.gate_type is not None:
+        cfg.setdefault('TransformerLayer_setting', {})['gate_type'] = args.gate_type
+    
+    # MoE 参数
+    if args.use_moe:
+        cfg.setdefault('TransformerLayer_setting', {})['use_moe'] = True
+    if args.no_moe:
+        cfg.setdefault('TransformerLayer_setting', {})['use_moe'] = False
+    if args.num_experts is not None:
+        cfg.setdefault('TransformerLayer_setting', {})['num_experts'] = args.num_experts
+    if args.moe_top_k is not None:
+        cfg.setdefault('TransformerLayer_setting', {})['moe_top_k'] = args.moe_top_k
+    
+    # Masked Diffusion 参数
+    if args.enable_masking:
+        cfg.setdefault('masking', {})['enable'] = True
+    if args.disable_masking:
+        cfg.setdefault('masking', {})['enable'] = False
+    if args.expression_mask_ratio is not None:
+        cfg.setdefault('masking', {})['expression_mask_ratio'] = args.expression_mask_ratio
+    if args.position_mask_ratio is not None:
+        cfg.setdefault('masking', {})['position_mask_ratio'] = args.position_mask_ratio
+    
+    # 打印配置
     logger.info(f"训练模式: {cfg.get('training_mode', 'joint')}")
     logger.info(f"扩散步数: {cfg.get('diffusion', {}).get('diffusion_steps', 1000)}")
+    logger.info(f"Gated Attention: {cfg.get('TransformerLayer_setting', {}).get('use_gated_attention', False)}")
+    if cfg.get('TransformerLayer_setting', {}).get('use_gated_attention'):
+        logger.info(f"  - Gate type: {cfg.get('TransformerLayer_setting', {}).get('gate_type', 'headwise')}")
+    logger.info(f"MoE: {cfg.get('TransformerLayer_setting', {}).get('use_moe', False)}")
+    if cfg.get('TransformerLayer_setting', {}).get('use_moe'):
+        logger.info(f"  - Num experts: {cfg.get('TransformerLayer_setting', {}).get('num_experts', 8)}")
+        logger.info(f"  - Top-K: {cfg.get('TransformerLayer_setting', {}).get('moe_top_k', 2)}")
+    logger.info(f"Masked Diffusion: {cfg.get('masking', {}).get('enable', False)}")
     
     # 数据配置
     data_dir = args.data_dir or cfg.get("data", {}).get("processed_data_dir", "./data/processed")
@@ -529,10 +576,44 @@ def main():
     train_parser.add_argument("--config", type=str, required=True, help="配置文件路径")
     train_parser.add_argument("--data_dir", type=str, default=None, help="预处理数据目录")
     train_parser.add_argument("--batch_size", type=int, default=None, help="批次大小")
+    train_parser.add_argument("--epochs", type=int, default=None, help="训练轮数")
+    train_parser.add_argument("--lr", type=float, default=None, help="学习率")
+    train_parser.add_argument("--training_mode", type=str, default=None,
+                              choices=['joint', 'expr_to_pos', 'pos_to_expr'],
+                              help="训练模式")
     train_parser.add_argument("--streaming", action="store_true", help="流式加载数据（大数据集推荐）")
     train_parser.add_argument("--buffer_size", type=int, default=None, help="流式加载的 shuffle buffer 大小")
     train_parser.add_argument("--resume", type=str, default=None, help="恢复训练的检查点路径")
     train_parser.add_argument("--test_after_train", action="store_true", help="训练后运行测试")
+    
+    # Gated Attention 参数
+    train_parser.add_argument("--use_gated_attention", action="store_true",
+                              help="启用 Gated Attention")
+    train_parser.add_argument("--no_gated_attention", action="store_true",
+                              help="禁用 Gated Attention")
+    train_parser.add_argument("--gate_type", type=str, default=None,
+                              choices=['headwise', 'elementwise'],
+                              help="门控类型")
+    
+    # MoE 参数
+    train_parser.add_argument("--use_moe", action="store_true",
+                              help="启用 Mixture of Experts")
+    train_parser.add_argument("--no_moe", action="store_true",
+                              help="禁用 Mixture of Experts")
+    train_parser.add_argument("--num_experts", type=int, default=None,
+                              help="专家数量")
+    train_parser.add_argument("--moe_top_k", type=int, default=None,
+                              help="每个 token 激活的专家数量")
+    
+    # Masked Diffusion 参数
+    train_parser.add_argument("--enable_masking", action="store_true",
+                              help="启用 Masked Diffusion")
+    train_parser.add_argument("--disable_masking", action="store_true",
+                              help="禁用 Masked Diffusion")
+    train_parser.add_argument("--expression_mask_ratio", type=float, default=None,
+                              help="表达量遮罩比例")
+    train_parser.add_argument("--position_mask_ratio", type=float, default=None,
+                              help="位置遮罩比例")
     
     # ==================== 测试命令 ====================
     test_parser = subparsers.add_parser("test", help="测试模型")

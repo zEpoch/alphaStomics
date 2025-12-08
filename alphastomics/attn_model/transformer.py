@@ -12,6 +12,7 @@ from torch.nn.modules.normalization import LayerNorm
 from alphastomics.attn_model.self_attention import SelfAttentionModel
 from alphastomics.attn_model.gated_attention import GatedSelfAttentionModel
 from alphastomics.attn_model.layers import PositionNorm
+from alphastomics.attn_model.moe import MoETransformerFFN
 
 
 class TransformerLayer(nn.Module):
@@ -43,7 +44,12 @@ class TransformerLayer(nn.Module):
         last_layer: bool = False,
         use_gated_attention: bool = False,
         gate_type: str = 'headwise',
-        use_qk_norm: bool = True
+        use_qk_norm: bool = True,
+        # MoE 参数
+        use_moe: bool = False,
+        num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_load_balance_loss_weight: float = 0.01
     ):
         """
         初始化 Transformer 层
@@ -62,6 +68,10 @@ class TransformerLayer(nn.Module):
             use_gated_attention: 是否使用 Gated Attention (推荐 True)
             gate_type: 门控类型 'headwise' / 'elementwise' / 'none'
             use_qk_norm: 是否对 Q/K 进行 RMSNorm (提升稳定性)
+            use_moe: 是否使用 MoE 替代 FFN (提升模型容量)
+            num_experts: MoE 专家数量
+            moe_top_k: 每个 token 激活的专家数量
+            moe_load_balance_loss_weight: MoE 负载均衡损失权重
         """
         # 确保 layer_norm_eps 是浮点数（防止配置文件中是字符串）
         layer_norm_eps = float(layer_norm_eps) if isinstance(layer_norm_eps, str) else layer_norm_eps
@@ -92,17 +102,33 @@ class TransformerLayer(nn.Module):
                 last_layer=last_layer
             )
         
-        # 表达量的前馈网络
-        self.lin_expression_features_1 = Linear(
-            in_features=expression_dim,
-            out_features=dim_ff_expression,
-            **kw
-        )
-        self.lin_expression_features_2 = Linear(
-            in_features=dim_ff_expression,
-            out_features=expression_dim,
-            **kw
-        )
+        self.use_moe = use_moe
+        self.moe_load_balance_loss_weight = moe_load_balance_loss_weight
+        
+        # 表达量的前馈网络（可选 MoE）
+        if use_moe:
+            self.expression_ffn = MoETransformerFFN(
+                d_model=expression_dim,
+                d_ff=dim_ff_expression,
+                use_moe=True,
+                num_experts=num_experts,
+                top_k=moe_top_k,
+                dropout=dropout,
+                activation='relu',
+                load_balance_loss_weight=moe_load_balance_loss_weight
+            )
+        else:
+            # 标准 FFN
+            self.lin_expression_features_1 = Linear(
+                in_features=expression_dim,
+                out_features=dim_ff_expression,
+                **kw
+            )
+            self.lin_expression_features_2 = Linear(
+                in_features=dim_ff_expression,
+                out_features=expression_dim,
+                **kw
+            )
         
         # 表达量的层归一化
         self.norm_node_features_1 = LayerNorm(
@@ -159,7 +185,7 @@ class TransformerLayer(nn.Module):
         expression_features: torch.Tensor,
         diffusion_time: torch.Tensor,
         position_features: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         前向传播
         
@@ -172,7 +198,10 @@ class TransformerLayer(nn.Module):
             output_expression: (B, N, expr_dim) 输出表达量
             output_positions: (B, N, 3) 输出位置
             output_diffusion_time: (B, time_dim) 输出时间
+            moe_aux_loss: MoE 辅助损失（如果使用 MoE）
         """
+        moe_aux_loss = None
+        
         # 自注意力
         attn_expression, attn_positions, attn_time = self.attn_model(
             expression_features=expression_features,
@@ -188,14 +217,19 @@ class TransformerLayer(nn.Module):
             expression_features + self.dropout_expression_features_1(attn_expression)
         )
         
-        # 表达量：前馈网络
-        ff_output_expression = self.lin_expression_features_2(
-            self.dropout_expression_features_2(
-                self.activation(
-                    self.lin_expression_features_1(output_expression)
+        # 表达量：前馈网络（MoE 或 标准 FFN）
+        if self.use_moe:
+            ff_output_expression, aux_loss = self.expression_ffn(output_expression)
+            moe_aux_loss = aux_loss
+        else:
+            ff_output_expression = self.lin_expression_features_2(
+                self.dropout_expression_features_2(
+                    self.activation(
+                        self.lin_expression_features_1(output_expression)
+                    )
                 )
             )
-        )
+        
         ff_output_expression = self.dropout_expression_features_3(ff_output_expression)
         
         # 表达量：残差连接 + LayerNorm
@@ -224,4 +258,4 @@ class TransformerLayer(nn.Module):
         else:
             output_time = diffusion_time
             
-        return output_expression, output_positions, output_time
+        return output_expression, output_positions, output_time, moe_aux_loss

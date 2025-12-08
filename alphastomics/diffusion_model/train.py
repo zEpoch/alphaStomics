@@ -86,7 +86,11 @@ class AlphaSTomicsModule(pl.LightningModule):
             mlp_out_position_norm_setting=cfg["mlp_out_position_norm_setting"],
             use_gated_attention=transformer_cfg.get("use_gated_attention", False),
             gate_type=transformer_cfg.get("gate_type", "headwise"),
-            use_qk_norm=transformer_cfg.get("use_qk_norm", True)
+            use_qk_norm=transformer_cfg.get("use_qk_norm", True),
+            use_moe=transformer_cfg.get("use_moe", False),
+            num_experts=transformer_cfg.get("num_experts", 8),
+            moe_top_k=transformer_cfg.get("moe_top_k", 2),
+            moe_load_balance_loss_weight=transformer_cfg.get("moe_load_balance_loss_weight", 0.01)
         )
         
         # 初始化噪声模型
@@ -135,7 +139,7 @@ class AlphaSTomicsModule(pl.LightningModule):
         positions: torch.Tensor,
         diffusion_time: torch.Tensor,
         node_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         前向传播
         
@@ -148,13 +152,20 @@ class AlphaSTomicsModule(pl.LightningModule):
         Returns:
             pred_expression: (B, N, G) 预测的原始表达量
             pred_positions: (B, N, 3) 预测的原始位置
+            moe_aux_loss: MoE 辅助损失（如果启用）
         """
-        return self.model(
+        output = self.model(
             expression_features=expression,
             diffusion_time=diffusion_time,
             position_features=positions,
             node_mask=node_mask
         )
+        
+        # 处理返回值：Model 可能返回 2 或 3 个值
+        if len(output) == 3:
+            return output  # (pred_expr, pred_pos, moe_aux_loss)
+        else:
+            return output[0], output[1], None  # (pred_expr, pred_pos, None)
     
     def _prepare_batch(self, batch: Any) -> DataHolder:
         """
@@ -208,7 +219,7 @@ class AlphaSTomicsModule(pl.LightningModule):
         )
         
         # 模型预测
-        pred_expression, pred_positions = self.forward(
+        pred_expression, pred_positions, moe_aux_loss = self.forward(
             expression=noisy_data.noisy_expression,
             positions=noisy_data.noisy_positions,
             diffusion_time=noisy_data.diffusion_time,
@@ -271,7 +282,7 @@ class AlphaSTomicsModule(pl.LightningModule):
             apply_masking=False
         )
         
-        pred_expression, pred_positions = self.forward(
+        pred_expression, pred_positions, moe_aux_loss = self.forward(
             expression=noisy_data.noisy_expression,
             positions=noisy_data.noisy_positions,
             diffusion_time=noisy_data.diffusion_time,

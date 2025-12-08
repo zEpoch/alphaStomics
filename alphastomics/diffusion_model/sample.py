@@ -119,12 +119,17 @@ class DiffusionSampler:
             )
             
             # 模型预测
-            pred_expression, pred_positions = self.model(
+            output = self.model(
                 expression_features=z_t.noisy_expression,
                 diffusion_time=z_t.diffusion_time,
                 position_features=z_t.noisy_positions,
                 node_mask=node_mask
             )
+            # 处理返回值：可能是 2 个或 3 个值（如果启用 MoE）
+            if len(output) == 3:
+                pred_expression, pred_positions, _ = output
+            else:
+                pred_expression, pred_positions = output
             
             # 采样下一步
             z_t = self.noise_model.sample_zs_from_zt_and_pred(

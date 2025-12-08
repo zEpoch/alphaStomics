@@ -36,7 +36,12 @@ class Model(nn.Module):
         positionMLP_eps: float = 1e-6,
         use_gated_attention: bool = False,
         gate_type: str = 'headwise',
-        use_qk_norm: bool = True
+        use_qk_norm: bool = True,
+        # MoE 参数
+        use_moe: bool = False,
+        num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_load_balance_loss_weight: float = 0.01
     ):
         """
         初始化模型
@@ -53,6 +58,10 @@ class Model(nn.Module):
             use_gated_attention: 是否使用 Gated Attention (推荐 True)
             gate_type: 门控类型 'headwise' / 'elementwise' / 'none'
             use_qk_norm: 是否对 Q/K 进行 RMSNorm (提升稳定性)
+            use_moe: 是否使用 MoE 替代 FFN (提升模型容量)
+            num_experts: MoE 专家数量
+            moe_top_k: 每个 token 激活的专家数量
+            moe_load_balance_loss_weight: MoE 负载均衡损失权重
         """
         super().__init__()
         self.input_expression_dims = self.output_expression_dims = input_dims
@@ -115,7 +124,11 @@ class Model(nn.Module):
                 last_layer=False,
                 use_gated_attention=use_gated_attention,
                 gate_type=gate_type,
-                use_qk_norm=use_qk_norm
+                use_qk_norm=use_qk_norm,
+                use_moe=use_moe,
+                num_experts=num_experts,
+                moe_top_k=moe_top_k,
+                moe_load_balance_loss_weight=moe_load_balance_loss_weight
             )
             for _ in range(TransformerLayer_setting['num_layers'])
         ])
@@ -174,6 +187,7 @@ class Model(nn.Module):
         Returns:
             out_expression: (B, N, G) 预测的原始表达量
             out_position: (B, N, 3) 预测的原始位置
+            moe_aux_loss: MoE 辅助损失（如果使用 MoE）
         """
         batch_size, num_nodes, _ = expression_features.shape
         
@@ -187,12 +201,19 @@ class Model(nn.Module):
         pos = self.position_mlp(position_features)        # (B, N, 3)
 
         # Transformer 处理
+        total_moe_aux_loss = None
         for layer in self.transformer_layers:
-            x, pos, y = layer(
+            x, pos, y, moe_aux_loss = layer(
                 expression_features=x,
                 diffusion_time=y,
                 position_features=pos
             )
+            # 累积 MoE 辅助损失
+            if moe_aux_loss is not None:
+                if total_moe_aux_loss is None:
+                    total_moe_aux_loss = moe_aux_loss
+                else:
+                    total_moe_aux_loss = total_moe_aux_loss + moe_aux_loss
 
         # 输出表达量
         out_expression = self.mlp_out_expression(x)  # (B, N, G)
@@ -219,4 +240,4 @@ class Model(nn.Module):
         mean_pos = masked_sum / num_valid
         out_position = (out_position - mean_pos) * node_mask.unsqueeze(-1)
         
-        return out_expression, out_position
+        return out_expression, out_position, total_moe_aux_loss
