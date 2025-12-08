@@ -75,6 +75,7 @@ class AlphaSTomicsModule(pl.LightningModule):
         self.training_mode = cfg.get("training_mode", "joint")
         
         # 初始化模型
+        transformer_cfg = cfg["TransformerLayer_setting"]
         self.model = Model(
             input_dims=num_genes,
             mlp_in_expression_setting=cfg["mlp_in_expression_setting"],
@@ -83,6 +84,9 @@ class AlphaSTomicsModule(pl.LightningModule):
             TransformerLayer_setting=cfg["TransformerLayer_setting"],
             mlp_out_expression_setting=cfg["mlp_out_expression_setting"],
             mlp_out_position_norm_setting=cfg["mlp_out_position_norm_setting"],
+            use_gated_attention=transformer_cfg.get("use_gated_attention", False),
+            gate_type=transformer_cfg.get("gate_type", "headwise"),
+            use_qk_norm=transformer_cfg.get("use_qk_norm", True)
         )
         
         # 初始化噪声模型

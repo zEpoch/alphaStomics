@@ -34,6 +34,9 @@ class Model(nn.Module):
         mlp_out_expression_setting: dict,
         mlp_out_position_norm_setting: dict,
         positionMLP_eps: float = 1e-6,
+        use_gated_attention: bool = False,
+        gate_type: str = 'headwise',
+        use_qk_norm: bool = True
     ):
         """
         初始化模型
@@ -47,6 +50,9 @@ class Model(nn.Module):
             mlp_out_expression_setting: 表达量输出MLP配置
             mlp_out_position_norm_setting: 位置范数输出MLP配置
             positionMLP_eps: 数值稳定性参数
+            use_gated_attention: 是否使用 Gated Attention (推荐 True)
+            gate_type: 门控类型 'headwise' / 'elementwise' / 'none'
+            use_qk_norm: 是否对 Q/K 进行 RMSNorm (提升稳定性)
         """
         super().__init__()
         self.input_expression_dims = self.output_expression_dims = input_dims
@@ -91,6 +97,10 @@ class Model(nn.Module):
             eps=self.positionMLP_eps
         )
         
+        # 确保 layer_norm_eps 是浮点数
+        layer_norm_eps = TransformerLayer_setting.get('layer_norm_eps', 1e-6)
+        layer_norm_eps = float(layer_norm_eps) if isinstance(layer_norm_eps, str) else layer_norm_eps
+        
         # Transformer 层
         self.transformer_layers = nn.ModuleList([
             TransformerLayer(
@@ -101,8 +111,11 @@ class Model(nn.Module):
                 dim_ff_expression=TransformerLayer_setting['dim_ff_expression'],
                 dim_ff_diffusion_time=TransformerLayer_setting['dim_ff_diffusion_time'],
                 dropout=TransformerLayer_setting['dropout'],
-                layer_norm_eps=TransformerLayer_setting['layer_norm_eps'],
-                last_layer=False
+                layer_norm_eps=layer_norm_eps,
+                last_layer=False,
+                use_gated_attention=use_gated_attention,
+                gate_type=gate_type,
+                use_qk_norm=use_qk_norm
             )
             for _ in range(TransformerLayer_setting['num_layers'])
         ])

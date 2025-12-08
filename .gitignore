@@ -8,6 +8,8 @@ wandb/
 .h5ad
 demo_train.log
 demo_train.py
+demo_gated.log
+demo_gated.py
 # C extensions
 *.so
 *.txt

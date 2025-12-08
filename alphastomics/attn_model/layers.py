@@ -81,12 +81,13 @@ class PositionNorm(nn.Module):
     def __init__(
         self, 
         eps: float = 1e-6, 
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
+        **kwargs  # 忽略额外的关键字参数
     ):
-        kw = {"device": device} if device is not None else {}
         super(PositionNorm, self).__init__()
         self.normalized_shape = (1,)
         self.eps = eps
+        kw = {"device": device} if device is not None else {}
         self.weight = nn.Parameter(torch.ones(self.normalized_shape, **kw))
         self.reset_parameters()
     
@@ -103,7 +104,9 @@ class PositionNorm(nn.Module):
         """
         norm = torch.norm(positions, dim=-1, keepdim=True)  # (B, N, 1)
         mean_norm = torch.mean(norm, dim=1, keepdim=True)   # (B, 1, 1)
-        new_positions = self.weight * positions / (mean_norm + self.eps)
+        # 确保 eps 是浮点数
+        eps_val = float(self.eps) if isinstance(self.eps, str) else self.eps
+        new_positions = self.weight * positions / (mean_norm + eps_val)
         return new_positions
 
 

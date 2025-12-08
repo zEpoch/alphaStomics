@@ -10,6 +10,7 @@ from torch.nn.modules.dropout import Dropout
 from torch.nn.modules.linear import Linear
 from torch.nn.modules.normalization import LayerNorm
 from alphastomics.attn_model.self_attention import SelfAttentionModel
+from alphastomics.attn_model.gated_attention import GatedSelfAttentionModel
 from alphastomics.attn_model.layers import PositionNorm
 
 
@@ -22,6 +23,10 @@ class TransformerLayer(nn.Module):
     - 前馈网络
     - 残差连接
     - 层归一化
+    
+    支持两种注意力机制：
+    - Linear Attention (默认，旧版)
+    - Gated Attention (推荐，新版)
     """
     
     def __init__(
@@ -35,7 +40,10 @@ class TransformerLayer(nn.Module):
         dropout: float = 0.1,
         layer_norm_eps: float = 1e-6,
         device: Optional[torch.device] = None,
-        last_layer: bool = False
+        last_layer: bool = False,
+        use_gated_attention: bool = False,
+        gate_type: str = 'headwise',
+        use_qk_norm: bool = True
     ):
         """
         初始化 Transformer 层
@@ -51,19 +59,38 @@ class TransformerLayer(nn.Module):
             layer_norm_eps: LayerNorm 的 epsilon
             device: 设备
             last_layer: 是否为最后一层
+            use_gated_attention: 是否使用 Gated Attention (推荐 True)
+            gate_type: 门控类型 'headwise' / 'elementwise' / 'none'
+            use_qk_norm: 是否对 Q/K 进行 RMSNorm (提升稳定性)
         """
+        # 确保 layer_norm_eps 是浮点数（防止配置文件中是字符串）
+        layer_norm_eps = float(layer_norm_eps) if isinstance(layer_norm_eps, str) else layer_norm_eps
+        
         kw = {"device": device} if device is not None else {}
         super().__init__()
         
-        # 自注意力模块
-        self.attn_model = SelfAttentionModel(
-            expression_features_dim=expression_dim,
-            diffusion_features_dim=diffusion_time_dim,
-            position_features_dim=position_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            last_layer=last_layer
-        )
+        # 自注意力模块（支持两种模式）
+        if use_gated_attention:
+            self.attn_model = GatedSelfAttentionModel(
+                expression_features_dim=expression_dim,
+                diffusion_features_dim=diffusion_time_dim,
+                position_features_dim=position_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                gate_type=gate_type,
+                use_qk_norm=use_qk_norm,
+                last_layer=last_layer
+            )
+        else:
+            # 旧版 Linear Attention
+            self.attn_model = SelfAttentionModel(
+                expression_features_dim=expression_dim,
+                diffusion_features_dim=diffusion_time_dim,
+                position_features_dim=position_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                last_layer=last_layer
+            )
         
         # 表达量的前馈网络
         self.lin_expression_features_1 = Linear(
