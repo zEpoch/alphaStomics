@@ -51,7 +51,6 @@ class SliceMetadata:
     slice_id: str
     n_cells: int
     n_genes: int
-    z_coord: float
     file_path: str
     has_cell_types: bool = False
     cell_type_counts: Optional[Dict[str, int]] = None
@@ -163,7 +162,6 @@ class Stage1Preprocessor:
         self,
         input_dir: str,
         output_dir: str,
-        z_coords: Optional[List[float]] = None,
         file_pattern: str = "*.h5ad",
     ) -> DatasetMetadata:
         """
@@ -172,7 +170,6 @@ class Stage1Preprocessor:
         Args:
             input_dir: 输入目录（包含 h5ad 文件）
             output_dir: 输出目录
-            z_coords: 每个切片的 z 坐标（可选）
             file_pattern: 文件匹配模式
         
         Returns:
@@ -195,77 +192,68 @@ class Stage1Preprocessor:
         
         logger.info(f"找到 {len(h5ad_files)} 个 h5ad 文件")
         
-        # 如果是 2D 数据且没有指定 z_coords，自动生成
-        if not self.position_is_3d and z_coords is None:
-            z_coords = [i * self.z_spacing for i in range(len(h5ad_files))]
-        
-        # ===== 第一遍扫描：确定基因列表和细胞类型 =====
+        # ===== 第一遍扫描：确定基因列表和细胞类型（仅读取元数据）=====
         logger.info("第一遍扫描：确定基因列表和细胞类型...")
-        
-        all_adata = []
-        for fpath in tqdm(h5ad_files, desc="加载文件"):
-            adata = anndata.read_h5ad(fpath)
-            adata.var_names_make_unique()
-            all_adata.append(adata)
         
         # 确定基因列表
         if self.fixed_gene_list is not None:
             self.selected_genes = self.fixed_gene_list
             logger.info(f"使用固定基因列表: {len(self.selected_genes)} 个基因")
         else:
-            # 找共同基因
-            common_genes = set(all_adata[0].var_names)
-            for adata in all_adata[1:]:
-                common_genes = common_genes.intersection(set(adata.var_names))
+            # 流式扫描，找共同基因
+            common_genes = None
+            for fpath in tqdm(h5ad_files, desc="扫描基因"):
+                adata = anndata.read_h5ad(fpath)
+                adata.var_names_make_unique()
+                current_genes = set(adata.var_names)
+                
+                if common_genes is None:
+                    common_genes = current_genes
+                else:
+                    common_genes = common_genes.intersection(current_genes)
+                
+                del adata  # 立即释放内存
+            
             self.selected_genes = sorted(list(common_genes))
             logger.info(f"使用共同基因: {len(self.selected_genes)} 个基因")
         
-        # 收集细胞类型
+        # 收集细胞类型（流式扫描）
         all_cell_types = set()
         if self.cell_type_key:
-            for adata in all_adata:
+            for fpath in tqdm(h5ad_files, desc="扫描细胞类型"):
+                adata = anndata.read_h5ad(fpath)
                 if self.cell_type_key in adata.obs.columns:
                     all_cell_types.update(adata.obs[self.cell_type_key].dropna().unique())
+                del adata  # 立即释放内存
         
         if all_cell_types:
             self.cell_type_mapping = {ct: i for i, ct in enumerate(sorted(all_cell_types))}
             logger.info(f"细胞类型数量: {len(self.cell_type_mapping)}")
         
-        # 如果需要全局坐标标准化，收集统计量
-        if self.normalize_position and self.position_is_3d:
-            all_positions = []
-            for adata in all_adata:
-                pos = self._get_positions(adata)
-                if pos is not None:
-                    all_positions.append(pos[:, :3])
-            
-            if all_positions:
-                all_positions = np.concatenate(all_positions, axis=0)
-                self.global_position_stats = {
-                    'mean': all_positions.mean(axis=0),
-                    'scale': np.abs(all_positions - all_positions.mean(axis=0)).max()
-                }
-                logger.info(f"全局坐标统计: mean={self.global_position_stats['mean']}, scale={self.global_position_stats['scale']}")
-        
-        # ===== 第二遍处理：预处理每张切片并保存 =====
-        logger.info("第二遍处理：预处理并保存...")
+        # ===== 第二遍处理：逐片处理并保存（流式）=====
+        logger.info("第二遍处理：逐片预处理并保存...")
         
         slices_metadata = []
         total_cells = 0
         
-        for i, (adata, fpath) in enumerate(tqdm(zip(all_adata, h5ad_files), total=len(all_adata), desc="处理切片")):
+        for i, fpath in enumerate(tqdm(h5ad_files, desc="处理切片")):
+            # 加载单个切片
+            adata = anndata.read_h5ad(fpath)
+            adata.var_names_make_unique()
+            
             slice_id = fpath.stem
-            z_coord = z_coords[i] if z_coords else 0.0
             
             # 处理单个切片
             slice_data, slice_meta = self._process_single_slice(
-                adata, slice_id, i, z_coord
+                adata, slice_id, i
             )
             
-            # 保存
-            output_file = output_dir / f"slice_{i:04d}_{slice_id}.pkl"
-            with open(output_file, 'wb') as f:
-                pickle.dump(slice_data, f)
+            # 立即释放内存
+            del adata
+            
+            # 保存为 parquet 格式（高压缩）
+            output_file = output_dir / f"slice_{i:04d}_{slice_id}.parquet"
+            self._save_slice_parquet(slice_data, output_file)
             
             slice_meta.file_path = str(output_file)
             slices_metadata.append(slice_meta)
@@ -282,8 +270,6 @@ class Stage1Preprocessor:
             slices=[asdict(s) for s in slices_metadata],
             position_key=self.position_key,
             position_is_3d=self.position_is_3d,
-            global_position_mean=self.global_position_stats.get('mean', None),
-            global_position_scale=self.global_position_stats.get('scale', None),
             preprocessing_params={
                 'scale': self.scale,
                 'normalize_position': self.normalize_position,
@@ -308,6 +294,43 @@ class Stage1Preprocessor:
         logger.info(f"输出目录: {output_dir}")
         
         return dataset_metadata
+    
+    def _save_slice_parquet(self, slice_data: Dict, output_file: Path):
+        """将切片数据保存为 parquet 格式（高压缩）"""
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            raise ImportError("需要安装 pyarrow: pip install pyarrow")
+        
+        n_cells = slice_data['n_cells']
+        
+        # 转为列表格式（parquet 需要）
+        rows = []
+        for i in range(n_cells):
+            row = {
+                'expression': slice_data['expression'][i].tolist(),
+                'positions': slice_data['positions'][i].tolist(),
+                'slice_id': slice_data['slice_id'],
+                'slice_idx': slice_data['slice_idx'],
+            }
+            
+            # 细胞类型（可选）
+            if slice_data['cell_types'] is not None:
+                row['cell_type'] = int(slice_data['cell_types'][i])
+            else:
+                row['cell_type'] = -1
+            
+            rows.append(row)
+        
+        # 保存为 parquet（zstd 最高压缩）
+        table = pa.Table.from_pylist(rows)
+        pq.write_table(
+            table, 
+            output_file, 
+            compression='zstd',
+            compression_level=9  # 最高压缩级别
+        )
     
     def _get_positions(self, adata) -> Optional[np.ndarray]:
         """获取坐标"""
@@ -334,7 +357,6 @@ class Stage1Preprocessor:
         adata,
         slice_id: str,
         slice_idx: int,
-        z_coord: float,
     ) -> Tuple[Dict, SliceMetadata]:
         """处理单个切片"""
         import scanpy as sc
@@ -383,13 +405,6 @@ class Stage1Preprocessor:
         
         if self.position_is_3d:
             positions = positions_raw[:, :3].copy().astype(np.float32)
-            
-            if self.normalize_position and self.global_position_stats:
-                positions = positions - self.global_position_stats['mean']
-                if self.global_position_stats['scale'] > 0:
-                    positions = positions / self.global_position_stats['scale']
-            
-            z_coord_value = float(positions[:, 2].mean())
         else:
             positions_2d = positions_raw[:, :2].copy().astype(np.float32)
             
@@ -399,9 +414,9 @@ class Stage1Preprocessor:
                 if scale > 0:
                     positions_2d = positions_2d / scale
             
-            z_col = np.full((n_cells, 1), z_coord, dtype=np.float32)
+            # 2D 数据：添加切片索引作为 z 坐标
+            z_col = np.full((n_cells, 1), slice_idx * self.z_spacing, dtype=np.float32)
             positions = np.hstack([positions_2d, z_col])
-            z_coord_value = z_coord
         
         # ===== 细胞类型 =====
         cell_types = None
@@ -427,14 +442,12 @@ class Stage1Preprocessor:
             'slice_id': slice_id,
             'slice_idx': slice_idx,
             'n_cells': n_cells,
-            'z_coord': z_coord_value,
         }
         
         slice_meta = SliceMetadata(
             slice_id=slice_id,
             n_cells=n_cells,
             n_genes=len(self.selected_genes),
-            z_coord=z_coord_value,
             file_path="",  # 稍后填充
             has_cell_types=has_cell_types,
             cell_type_counts=cell_type_counts,
@@ -650,6 +663,43 @@ class Stage2BatchGenerator:
         
         return merged
     
+    def _load_slice_data(self, file_path: str) -> Dict:
+        """加载切片数据（兼容 parquet 和 pickle 格式）"""
+        file_path = Path(file_path)
+        
+        if file_path.suffix == '.parquet':
+            # 从 parquet 加载
+            try:
+                import pyarrow.parquet as pq
+            except ImportError:
+                raise ImportError("需要安装 pyarrow: pip install pyarrow")
+            
+            table = pq.read_table(file_path)
+            df = table.to_pandas()
+            
+            # 转回 numpy 数组格式
+            n_cells = len(df)
+            
+            # 表达量和坐标需要从列表转回数组
+            expression = np.array([row for row in df['expression'].values], dtype=np.float32)
+            positions = np.array([row for row in df['positions'].values], dtype=np.float32)
+            
+            # 细胞类型
+            cell_types = df['cell_type'].values.astype(np.int32)
+            
+            return {
+                'expression': expression,
+                'positions': positions,
+                'cell_types': cell_types,
+                'slice_id': df['slice_id'].iloc[0],
+                'slice_idx': df['slice_idx'].iloc[0],
+                'n_cells': n_cells,
+            }
+        else:
+            # 兼容旧的 pickle 格式
+            with open(file_path, 'rb') as f:
+                return pickle.load(f)
+    
     def _build_cell_index(self, metadata: Dict) -> np.ndarray:
         """
         构建全局细胞索引
@@ -760,9 +810,8 @@ class Stage2BatchGenerator:
             if slice_idx not in slice_to_cells:
                 continue
             
-            # 加载该切片
-            with open(slice_info['file_path'], 'rb') as f:
-                slice_data = pickle.load(f)
+            # 加载该切片（支持 parquet 和 pickle）
+            slice_data = self._load_slice_data(slice_info['file_path'])
             
             # 提取需要的细胞
             cells_needed = slice_to_cells[slice_idx]
@@ -861,8 +910,7 @@ class Stage2BatchGenerator:
             if slice_idx not in slice_to_cells:
                 continue
             
-            with open(slice_info['file_path'], 'rb') as f:
-                slice_data = pickle.load(f)
+            slice_data = self._load_slice_data(slice_info['file_path'])
             
             cells_needed = slice_to_cells[slice_idx]
             cell_indices = [c[1] for c in cells_needed]
