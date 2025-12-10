@@ -663,42 +663,73 @@ class Stage2BatchGenerator:
         
         return merged
     
-    def _load_slice_data(self, file_path: str) -> Dict:
-        """加载切片数据（兼容 parquet 和 pickle 格式）"""
+    def _load_slice_data(self, file_path: str, row_indices: List[int]) -> Dict:
+        """
+        加载切片数据的指定行（按索引）
+        
+        Args:
+            file_path: 切片文件路径
+            row_indices: 需要读取的行索引列表
+        
+        Returns:
+            切片数据字典（仅包含指定的行）
+        """
         file_path = Path(file_path)
         
         if file_path.suffix == '.parquet':
             # 从 parquet 加载
             try:
                 import pyarrow.parquet as pq
+                import pyarrow.compute as pc
+                import pyarrow as pa
             except ImportError:
                 raise ImportError("需要安装 pyarrow: pip install pyarrow")
             
+            # 读取整个文件
             table = pq.read_table(file_path)
-            df = table.to_pandas()
             
-            # 转回 numpy 数组格式
-            n_cells = len(df)
+            # 使用 Arrow 的 take 操作提取指定行（零拷贝）
+            indices = pa.array(row_indices, type=pa.int64())
+            table = pc.take(table, indices)
             
-            # 表达量和坐标需要从列表转回数组
-            expression = np.array([row for row in df['expression'].values], dtype=np.float32)
-            positions = np.array([row for row in df['positions'].values], dtype=np.float32)
+            # 直接从 Arrow 转 NumPy，不经过 Pandas
+            n_cells = len(table)
             
-            # 细胞类型
-            cell_types = df['cell_type'].values.astype(np.int32)
+            # 表达量：List<float> → NumPy array
+            expression = np.array(table['expression'].to_pylist(), dtype=np.float32)
+            
+            # 坐标：List<float> → NumPy array
+            positions = np.array(table['positions'].to_pylist(), dtype=np.float32)
+            
+            # 细胞类型：int → NumPy array
+            cell_types = table['cell_type'].to_numpy().astype(np.int32)
+            
+            # 元数据（从第一行获取）
+            slice_id = table['slice_id'][0].as_py()
+            slice_idx = table['slice_idx'][0].as_py()
             
             return {
                 'expression': expression,
                 'positions': positions,
                 'cell_types': cell_types,
-                'slice_id': df['slice_id'].iloc[0],
-                'slice_idx': df['slice_idx'].iloc[0],
+                'slice_id': slice_id,
+                'slice_idx': slice_idx,
                 'n_cells': n_cells,
             }
         else:
             # 兼容旧的 pickle 格式
             with open(file_path, 'rb') as f:
-                return pickle.load(f)
+                data = pickle.load(f)
+            
+            # 提取指定行的子集
+            return {
+                'expression': data['expression'][row_indices],
+                'positions': data['positions'][row_indices],
+                'cell_types': data['cell_types'][row_indices] if data['cell_types'] is not None else None,
+                'slice_id': data['slice_id'],
+                'slice_idx': data['slice_idx'],
+                'n_cells': len(row_indices),
+            }
     
     def _build_cell_index(self, metadata: Dict) -> np.ndarray:
         """
@@ -810,19 +841,17 @@ class Stage2BatchGenerator:
             if slice_idx not in slice_to_cells:
                 continue
             
-            # 加载该切片（支持 parquet 和 pickle）
-            slice_data = self._load_slice_data(slice_info['file_path'])
-            
-            # 提取需要的细胞
+            # ===== 优化：只读取需要的行 =====
             cells_needed = slice_to_cells[slice_idx]
             cell_indices = [c[1] for c in cells_needed]
             
-            expr = slice_data['expression'][cell_indices]
-            pos = slice_data['positions'][cell_indices]
-            ct = slice_data['cell_types']
-            if ct is not None:
-                ct = ct[cell_indices]
-            else:
+            # 直接按索引读取（节省内存）
+            slice_data = self._load_slice_data(slice_info['file_path'], row_indices=cell_indices)
+            
+            expr = slice_data['expression']  # 已经是子集
+            pos = slice_data['positions']    # 已经是子集
+            ct = slice_data['cell_types']    # 已经是子集
+            if ct is None:
                 ct = np.full(len(cell_indices), -1, dtype=np.int32)
             
             # 添加到缓存
@@ -910,17 +939,17 @@ class Stage2BatchGenerator:
             if slice_idx not in slice_to_cells:
                 continue
             
-            slice_data = self._load_slice_data(slice_info['file_path'])
-            
+            # ===== 优化：只读取需要的行 =====
             cells_needed = slice_to_cells[slice_idx]
             cell_indices = [c[1] for c in cells_needed]
             
-            expr = slice_data['expression'][cell_indices]
-            pos = slice_data['positions'][cell_indices]
-            ct = slice_data['cell_types']
-            if ct is not None:
-                ct = ct[cell_indices]
-            else:
+            # 直接按索引读取
+            slice_data = self._load_slice_data(slice_info['file_path'], row_indices=cell_indices)
+            
+            expr = slice_data['expression']  # 已经是子集
+            pos = slice_data['positions']    # 已经是子集
+            ct = slice_data['cell_types']    # 已经是子集
+            if ct is None:
                 ct = np.full(len(cell_indices), -1, dtype=np.int32)
             
             for i in range(len(cell_indices)):
