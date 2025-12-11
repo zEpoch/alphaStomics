@@ -51,7 +51,8 @@ class SliceMetadata:
     slice_id: str
     n_cells: int
     n_genes: int
-    file_path: str
+    file_path: str  # 主文件路径（单文件或第一个分块）
+    file_paths: Optional[List[str]] = None  # 多文件切片的所有文件路径
     has_cell_types: bool = False
     cell_type_counts: Optional[Dict[str, int]] = None
 
@@ -100,6 +101,7 @@ class Stage1Preprocessor:
         normalize_position: bool = False,
         target_sum: float = 1e4,
         max_scale_value: float = 10.0,
+        max_cells_per_file: int = 50000,
     ):
         """
         Args:
@@ -113,6 +115,7 @@ class Stage1Preprocessor:
             normalize_position: 是否标准化坐标
             target_sum: normalize_total 的目标值
             max_scale_value: scale 后的最大值截断
+            max_cells_per_file: 每个 parquet 文件最大细胞数（防止 List index overflow）
         """
         self.gene_list_file = gene_list_file
         self.position_key = position_key
@@ -124,6 +127,7 @@ class Stage1Preprocessor:
         self.normalize_position = normalize_position
         self.target_sum = target_sum
         self.max_scale_value = max_scale_value
+        self.max_cells_per_file = max_cells_per_file
         
         # 加载固定基因列表
         self.fixed_gene_list = self._load_gene_list()
@@ -235,13 +239,78 @@ class Stage1Preprocessor:
         
         slices_metadata = []
         total_cells = 0
+        skipped_count = 0
         
         for i, fpath in enumerate(tqdm(h5ad_files, desc="处理切片")):
+            slice_id = fpath.stem
+            
+            # 检查是否已处理过（断点续传支持）
+            output_file = output_dir / f"slice_{i:04d}_{slice_id}.parquet"
+            base_name = f"slice_{i:04d}_{slice_id}"
+            
+            # 检查单文件或分块文件是否存在
+            part_files = sorted(output_dir.glob(f"{base_name}_part*.parquet"))
+            existing_files = part_files if part_files else ([output_file] if output_file.exists() else [])
+            
+            if existing_files:
+                # 加载已有元数据（需要统计 total_cells）
+                try:
+                    import pyarrow.parquet as pq
+                    
+                    n_cells = 0
+                    schema_names = None
+                    total_file_size = 0
+                    
+                    # 遍历所有文件统计细胞数
+                    for ef in existing_files:
+                        file_size = ef.stat().st_size
+                        if file_size == 0:
+                            raise ValueError(f"文件大小为 0 字节: {ef}")
+                        total_file_size += file_size
+                        
+                        pf = pq.ParquetFile(ef)
+                        n_cells += pf.metadata.num_rows
+                        if schema_names is None:
+                            schema_names = pf.schema.names
+                        del pf
+                    
+                    if n_cells == 0:
+                        raise ValueError(f"文件中细胞数为 0")
+                    
+                    slice_meta = SliceMetadata(
+                        slice_id=slice_id,
+                        n_cells=n_cells,
+                        n_genes=len(self.selected_genes),
+                        file_path=str(existing_files[0]),
+                        file_paths=[str(f) for f in existing_files] if len(existing_files) > 1 else None,
+                        has_cell_types='cell_type' in schema_names,
+                    )
+                    slices_metadata.append(slice_meta)
+                    total_cells += n_cells
+                    skipped_count += 1
+                    
+                    files_desc = f"{len(existing_files)} 个文件" if len(existing_files) > 1 else existing_files[0].name
+                    logger.info(f"跳过已处理的切片: {slice_id} ({files_desc}, {n_cells} 细胞, {total_file_size/1024/1024:.1f}MB)")
+                    continue  # 跳过已处理的切片
+                except Exception as e:
+                    import traceback
+                    logger.warning(
+                        f"无法读取已有文件，将重新处理。\n"
+                        f"  错误类型: {type(e).__name__}\n"
+                        f"  错误信息: {e}\n"
+                        f"  详细堆栈:\n{traceback.format_exc()}"
+                    )
+                    # 删除损坏的文件
+                    for ef in existing_files:
+                        try:
+                            ef.unlink()
+                            logger.info(f"  删除损坏文件: {ef.name}")
+                        except:
+                            pass
+            
             # 加载单个切片
             adata = anndata.read_h5ad(fpath)
             adata.var_names_make_unique()
-            
-            slice_id = fpath.stem
             
             # 处理单个切片
             slice_data, slice_meta = self._process_single_slice(
@@ -251,13 +320,16 @@ class Stage1Preprocessor:
             # 立即释放内存
             del adata
             
-            # 保存为 parquet 格式（高压缩）
-            output_file = output_dir / f"slice_{i:04d}_{slice_id}.parquet"
-            self._save_slice_parquet(slice_data, output_file)
+            # 保存为 parquet 格式（高压缩，支持分块）
+            saved_files = self._save_slice_parquet(slice_data, output_file)
             
-            slice_meta.file_path = str(output_file)
+            slice_meta.file_path = saved_files[0]
+            slice_meta.file_paths = saved_files if len(saved_files) > 1 else None
             slices_metadata.append(slice_meta)
             total_cells += slice_meta.n_cells
+        
+        if skipped_count > 0:
+            logger.info(f"断点续传：跳过了 {skipped_count} 个已处理的切片")
         
         # 创建数据集元数据
         dataset_metadata = DatasetMetadata(
@@ -295,8 +367,17 @@ class Stage1Preprocessor:
         
         return dataset_metadata
     
-    def _save_slice_parquet(self, slice_data: Dict, output_file: Path):
-        """将切片数据保存为 parquet 格式（高压缩）"""
+    def _save_slice_parquet(self, slice_data: Dict, output_file: Path) -> List[str]:
+        """
+        将切片数据保存为 parquet 格式（高压缩）
+        
+        如果细胞数超过 max_cells_per_file，会自动分块保存为多个文件：
+        - slice_0000_xxx.parquet（小切片，单文件）
+        - slice_0000_xxx_part000.parquet, _part001.parquet, ...（大切片，多文件）
+        
+        Returns:
+            保存的文件路径列表
+        """
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
@@ -304,10 +385,42 @@ class Stage1Preprocessor:
             raise ImportError("需要安装 pyarrow: pip install pyarrow")
         
         n_cells = slice_data['n_cells']
+        max_cells = self.max_cells_per_file
         
-        # 转为列表格式（parquet 需要）
+        # 判断是否需要分块
+        if n_cells <= max_cells:
+            # 小切片：单文件保存
+            self._write_parquet_chunk(slice_data, 0, n_cells, output_file)
+            return [str(output_file)]
+        
+        # 大切片：分块保存
+        n_parts = (n_cells + max_cells - 1) // max_cells
+        saved_files = []
+        
+        # 修改文件名格式：slice_0000_xxx_part000.parquet
+        base_name = output_file.stem  # slice_0000_xxx
+        parent_dir = output_file.parent
+        
+        for part_idx in range(n_parts):
+            start_idx = part_idx * max_cells
+            end_idx = min((part_idx + 1) * max_cells, n_cells)
+            
+            part_file = parent_dir / f"{base_name}_part{part_idx:03d}.parquet"
+            self._write_parquet_chunk(slice_data, start_idx, end_idx, part_file)
+            saved_files.append(str(part_file))
+            
+            logger.debug(f"  保存分块 {part_idx+1}/{n_parts}: {end_idx - start_idx} 细胞 -> {part_file.name}")
+        
+        logger.info(f"  大切片分块保存: {n_cells} 细胞 -> {n_parts} 个文件")
+        return saved_files
+    
+    def _write_parquet_chunk(self, slice_data: Dict, start_idx: int, end_idx: int, output_file: Path):
+        """写入单个 parquet 文件块"""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        
         rows = []
-        for i in range(n_cells):
+        for i in range(start_idx, end_idx):
             row = {
                 'expression': slice_data['expression'][i].tolist(),
                 'positions': slice_data['positions'][i].tolist(),
@@ -663,18 +776,27 @@ class Stage2BatchGenerator:
         
         return merged
     
-    def _load_slice_data(self, file_path: str, row_indices: List[int]) -> Dict:
+    def _load_slice_data(self, slice_info: Dict, row_indices: List[int]) -> Dict:
         """
         加载切片数据的指定行（按索引）
         
+        支持单文件和多文件（分块）切片。
+        
         Args:
-            file_path: 切片文件路径
-            row_indices: 需要读取的行索引列表
+            slice_info: 切片元数据字典，包含 file_path 和可选的 file_paths
+            row_indices: 需要读取的行索引列表（相对于整个切片的全局索引）
         
         Returns:
             切片数据字典（仅包含指定的行）
         """
-        file_path = Path(file_path)
+        file_paths = slice_info.get('file_paths')
+        
+        if file_paths and len(file_paths) > 1:
+            # 多文件切片：需要计算每个索引落在哪个文件
+            return self._load_multi_file_slice(file_paths, row_indices)
+        
+        # 单文件切片
+        file_path = Path(slice_info['file_path'])
         
         if file_path.suffix == '.parquet':
             # 从 parquet 加载
@@ -685,10 +807,15 @@ class Stage2BatchGenerator:
             except ImportError:
                 raise ImportError("需要安装 pyarrow: pip install pyarrow")
             
-            # 读取整个文件
-            table = pq.read_table(file_path)
+            # 使用 memory_map=True 让操作系统按需加载数据页面，减少实际内存占用
+            # 只读取需要的列，进一步减少内存
+            table = pq.read_table(
+                file_path, 
+                columns=['expression', 'positions', 'cell_type', 'slice_id', 'slice_idx'],
+                memory_map=True  # 内存映射，按需加载
+            )
             
-            # 使用 Arrow 的 take 操作提取指定行（零拷贝）
+            # 提取指定行
             indices = pa.array(row_indices, type=pa.int64())
             table = pc.take(table, indices)
             
@@ -730,6 +857,97 @@ class Stage2BatchGenerator:
                 'slice_idx': data['slice_idx'],
                 'n_cells': len(row_indices),
             }
+    
+    def _load_multi_file_slice(self, file_paths: List[str], row_indices: List[int]) -> Dict:
+        """
+        加载多文件（分块）切片的指定行
+        
+        Args:
+            file_paths: 所有分块文件的路径列表
+            row_indices: 需要读取的行索引（相对于整个切片的全局索引）
+        
+        Returns:
+            切片数据字典
+        """
+        import pyarrow.parquet as pq
+        import pyarrow.compute as pc
+        import pyarrow as pa
+        
+        # 1. 先获取每个文件的行数范围
+        file_row_ranges = []  # [(start, end, file_path), ...]
+        current_row = 0
+        
+        for fp in file_paths:
+            pf = pq.ParquetFile(fp)
+            n_rows = pf.metadata.num_rows
+            file_row_ranges.append((current_row, current_row + n_rows, fp))
+            current_row += n_rows
+            del pf
+        
+        # 2. 确定每个索引落在哪个文件
+        file_to_local_indices = {}  # {file_path: [(global_idx, local_idx), ...]}
+        
+        for global_idx in row_indices:
+            for start, end, fp in file_row_ranges:
+                if start <= global_idx < end:
+                    local_idx = global_idx - start
+                    if fp not in file_to_local_indices:
+                        file_to_local_indices[fp] = []
+                    file_to_local_indices[fp].append((global_idx, local_idx))
+                    break
+        
+        # 3. 从每个相关文件读取数据
+        all_expression = []
+        all_positions = []
+        all_cell_types = []
+        slice_id = None
+        slice_idx = None
+        
+        # 按原始顺序收集结果
+        results_by_global_idx = {}
+        
+        for fp, indices_info in file_to_local_indices.items():
+            local_indices = [li for _, li in indices_info]
+            
+            # 读取文件
+            table = pq.read_table(
+                fp,
+                columns=['expression', 'positions', 'cell_type', 'slice_id', 'slice_idx'],
+                memory_map=True
+            )
+            
+            # 提取行
+            indices_arr = pa.array(local_indices, type=pa.int64())
+            subtable = pc.take(table, indices_arr)
+            
+            # 获取元数据
+            if slice_id is None:
+                slice_id = subtable['slice_id'][0].as_py()
+                slice_idx = subtable['slice_idx'][0].as_py()
+            
+            # 保存结果
+            for i, (global_idx, _) in enumerate(indices_info):
+                results_by_global_idx[global_idx] = {
+                    'expression': subtable['expression'][i].as_py(),
+                    'positions': subtable['positions'][i].as_py(),
+                    'cell_type': subtable['cell_type'][i].as_py(),
+                }
+        
+        # 4. 按原始顺序组装结果
+        for global_idx in row_indices:
+            r = results_by_global_idx[global_idx]
+            all_expression.append(r['expression'])
+            all_positions.append(r['positions'])
+            all_cell_types.append(r['cell_type'])
+        
+        return {
+            'expression': np.array(all_expression, dtype=np.float32),
+            'positions': np.array(all_positions, dtype=np.float32),
+            'cell_types': np.array(all_cell_types, dtype=np.int32),
+            'slice_id': slice_id,
+            'slice_idx': slice_idx,
+            'n_cells': len(row_indices),
+        }
     
     def _build_cell_index(self, metadata: Dict) -> np.ndarray:
         """
@@ -845,8 +1063,8 @@ class Stage2BatchGenerator:
             cells_needed = slice_to_cells[slice_idx]
             cell_indices = [c[1] for c in cells_needed]
             
-            # 直接按索引读取（节省内存）
-            slice_data = self._load_slice_data(slice_info['file_path'], row_indices=cell_indices)
+            # 直接按索引读取（节省内存，支持多文件切片）
+            slice_data = self._load_slice_data(slice_info, row_indices=cell_indices)
             
             expr = slice_data['expression']  # 已经是子集
             pos = slice_data['positions']    # 已经是子集
@@ -943,8 +1161,8 @@ class Stage2BatchGenerator:
             cells_needed = slice_to_cells[slice_idx]
             cell_indices = [c[1] for c in cells_needed]
             
-            # 直接按索引读取
-            slice_data = self._load_slice_data(slice_info['file_path'], row_indices=cell_indices)
+            # 直接按索引读取（支持多文件切片）
+            slice_data = self._load_slice_data(slice_info, row_indices=cell_indices)
             
             expr = slice_data['expression']  # 已经是子集
             pos = slice_data['positions']    # 已经是子集
@@ -1141,6 +1359,8 @@ def main():
     stage1_parser.add_argument('--cell_type_key', default='cell_type', help='细胞类型的 obs key')
     stage1_parser.add_argument('--no_scale', action='store_true', help='不做 z-score 标准化')
     stage1_parser.add_argument('--no_normalize_position', action='store_true', help='不标准化坐标')
+    stage1_parser.add_argument('--max_cells_per_file', type=int, default=50000, 
+                               help='每个 parquet 文件最大细胞数（防止大文件 List index overflow 错误）')
     
     # ===== 阶段二参数 =====
     stage2_parser = subparsers.add_parser('stage2', help='数据集生成（内存友好，无放回采样）')
@@ -1182,6 +1402,7 @@ def main():
             cell_type_key=args.cell_type_key,
             scale=not args.no_scale,
             normalize_position=not args.no_normalize_position,
+            max_cells_per_file=args.max_cells_per_file,
         )
         preprocessor.process(args.input_dir, args.output_dir)
     
