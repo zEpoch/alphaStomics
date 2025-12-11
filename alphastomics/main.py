@@ -90,6 +90,7 @@ def cmd_preprocess(args):
         log_normalize=do_log_normalize,
         scale=do_scale,
         normalize_position=preprocess_cfg.get("normalize_position", False),
+        max_cells_per_file=getattr(args, 'max_cells_per_file', 50000),
     )
     
     # 查找 h5ad 文件
@@ -166,6 +167,7 @@ def cmd_stage1(args):
         log_normalize=do_log_normalize,
         scale=do_scale,
         normalize_position=preprocess_cfg.get("normalize_position", False),
+        max_cells_per_file=getattr(args, 'max_cells_per_file', 50000),
     )
     
     # 查找 h5ad 文件
@@ -541,6 +543,8 @@ def main():
                                    help="跳过 log normalize（数据已预处理时使用）")
     preprocess_parser.add_argument("--skip-scale", action="store_true", dest="skip_scale",
                                    help="跳过 scale（z-score 标准化）")
+    preprocess_parser.add_argument("--max_cells_per_file", type=int, default=50000,
+                                   help="每个 parquet 文件最大细胞数（防止大文件 List index overflow 错误）")
     preprocess_parser.add_argument("--train_ratio", type=float, default=0.8, help="训练集比例")
     preprocess_parser.add_argument("--val_ratio", type=float, default=0.1, help="验证集比例")
     preprocess_parser.add_argument("--max_shard_size", type=int, default=100000, help="每个分片最大细胞数")
@@ -561,6 +565,8 @@ def main():
                                help="跳过 log normalize（数据已预处理时使用）")
     stage1_parser.add_argument("--skip-scale", action="store_true", dest="skip_scale",
                                help="跳过 scale（z-score 标准化）")
+    stage1_parser.add_argument("--max_cells_per_file", type=int, default=50000,
+                               help="每个 parquet 文件最大细胞数（防止大文件 List index overflow 错误）")
     
     # ==================== Stage2: 合并生成数据集 ====================
     stage2_parser = subparsers.add_parser("stage2", help="阶段二：合并多个 Stage1 输出，生成 Parquet 数据集")
