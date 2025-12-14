@@ -594,6 +594,7 @@ class Stage2BatchGenerator:
         val_ratio: float = 0.1,
         seed: int = 42,
         max_shard_size: int = 100_000,  # 每个 shard 文件最大细胞数
+        shards_per_batch: int = 10,     # 每批处理多少个 shard（平衡 IO 和内存）
     ):
         """
         Args:
@@ -602,12 +603,18 @@ class Stage2BatchGenerator:
             val_ratio: 验证集比例
             seed: 随机种子
             max_shard_size: 每个 shard 文件的最大细胞数（控制文件大小）
+            shards_per_batch: 每批同时处理的 shard 数量
+                - 值越大：IO 次数越少，但内存占用越大
+                - 值越小：内存占用越小，但 IO 次数越多
+                - 内存 ≈ shards_per_batch × max_shard_size × 每细胞大小
+                - 默认 10，即每批处理 10 个 shard（约 100 万细胞）
         """
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.seed = seed
         self.max_shard_size = max_shard_size
+        self.shards_per_batch = shards_per_batch
         
         np.random.seed(seed)
     
@@ -662,30 +669,22 @@ class Stage2BatchGenerator:
         
         logger.info(f"划分: train={len(train_index)}, val={len(val_index)}, test={len(test_index)}")
         
-        # ===== 第三步：流式生成各 split =====
-        logger.info("第三步：生成数据文件...")
+        # ===== 第三步：流式生成各 split（优化版：切片只读一次）=====
+        logger.info("第三步：生成数据文件（优化：每个切片只读取一次）...")
         
-        stats = {}
+        split_indices = {
+            'train': train_index,
+            'validation': val_index,
+            'test': test_index,
+        }
         
         if output_format == "parquet":
-            stats['train'] = self._generate_parquet_split(
-                train_index, metadata, output_dir / 'data', 'train'
-            )
-            stats['validation'] = self._generate_parquet_split(
-                val_index, metadata, output_dir / 'data', 'validation'
-            )
-            stats['test'] = self._generate_parquet_split(
-                test_index, metadata, output_dir / 'data', 'test'
+            stats = self._generate_all_splits_parquet(
+                split_indices, metadata, output_dir / 'data'
             )
         else:
-            stats['train'] = self._generate_pickle_split(
-                train_index, metadata, output_dir / 'data', 'train'
-            )
-            stats['validation'] = self._generate_pickle_split(
-                val_index, metadata, output_dir / 'data', 'validation'
-            )
-            stats['test'] = self._generate_pickle_split(
-                test_index, metadata, output_dir / 'data', 'test'
+            stats = self._generate_all_splits_pickle(
+                split_indices, metadata, output_dir / 'data'
             )
         
         # 保存数据集信息
@@ -979,12 +978,17 @@ class Stage2BatchGenerator:
         split_name: str,
     ) -> Dict:
         """
-        流式生成 parquet 格式的 split
+        流式生成 parquet 格式的 split（memmap 版：IO 最优 + 内存最优）
         
-        策略：
-        - 按 slice_idx 排序，这样可以顺序读取切片
-        - 每次只加载一个切片，提取需要的细胞
-        - 分 shard 写入，控制文件大小
+        策略：使用 numpy memmap 作为中间存储
+        1. 在磁盘上预创建 memmap 数组（占位）
+        2. 遍历切片，每个切片只读一次，直接写入 memmap 对应位置
+        3. 分 shard 读取 memmap 并转成 parquet
+        4. 删除临时 memmap 文件
+        
+        IO 复杂度：O(切片数) - 每个切片只读一次！
+        内存复杂度：O(max_shard_size) - 只有最后转 parquet 时需要
+        临时磁盘：O(n_cells × n_genes × 4 bytes)
         """
         try:
             import pyarrow as pa
@@ -1000,96 +1004,125 @@ class Stage2BatchGenerator:
             logger.warning(f"{split_name} 没有数据")
             return {'n_cells': 0, 'n_shards': 0}
         
-        # 按 slice_idx 排序，方便顺序读取
-        sort_order = np.lexsort((cell_index[:, 1], cell_index[:, 0]))
-        sorted_index = cell_index[sort_order]
+        n_genes = metadata['n_genes']
+        n_shards = (n_cells + self.max_shard_size - 1) // self.max_shard_size
         
-        # 记录每个切片需要哪些细胞
+        # ===== 第一步：创建 memmap 临时文件 =====
+        temp_dir = output_dir.parent / f'_temp_{split_name}'
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"创建临时 memmap 文件: {temp_dir}")
+        
+        # 创建 memmap 数组
+        expr_path = temp_dir / 'expression.dat'
+        pos_path = temp_dir / 'positions.dat'
+        ct_path = temp_dir / 'cell_types.dat'
+        sid_path = temp_dir / 'slice_ids.dat'
+        
+        expr_mmap = np.memmap(expr_path, dtype=np.float32, mode='w+', shape=(n_cells, n_genes))
+        pos_mmap = np.memmap(pos_path, dtype=np.float32, mode='w+', shape=(n_cells, 3))
+        ct_mmap = np.memmap(ct_path, dtype=np.int32, mode='w+', shape=(n_cells,))
+        sid_mmap = np.memmap(sid_path, dtype=np.int32, mode='w+', shape=(n_cells,))
+        
+        # 初始化
+        ct_mmap[:] = -1
+        sid_mmap[:] = -1
+        
+        # ===== 第二步：构建切片到细胞的映射 =====
+        # {slice_idx: [(cell_index中的位置, slice内的cell_idx), ...]}
         slice_to_cells = {}
-        for global_idx, (slice_idx, cell_idx) in enumerate(sorted_index):
+        for pos, (slice_idx, cell_idx) in enumerate(cell_index):
             slice_idx = int(slice_idx)
             if slice_idx not in slice_to_cells:
                 slice_to_cells[slice_idx] = []
-            slice_to_cells[slice_idx].append((global_idx, int(cell_idx)))
+            slice_to_cells[slice_idx].append((pos, int(cell_idx)))
         
-        # 流式处理
-        all_expression = []
-        all_positions = []
-        all_cell_types = []
-        all_slice_ids = []
+        # 构建 slice_idx -> slice_info 的映射
+        slice_info_map = {
+            (s['slice_idx'] if 'slice_idx' in s else i): s 
+            for i, s in enumerate(metadata['slices'])
+        }
         
-        shard_idx = 0
-        cells_in_current_shard = 0
+        # ===== 第三步：遍历切片，每个只读一次，写入 memmap =====
+        logger.info(f"遍历切片写入 memmap...")
         
-        def write_shard():
-            nonlocal shard_idx, cells_in_current_shard
-            nonlocal all_expression, all_positions, all_cell_types, all_slice_ids
+        for slice_idx in tqdm(sorted(slice_to_cells.keys()), desc=f"读取切片 ({split_name})"):
+            cells_needed = slice_to_cells[slice_idx]
+            cell_indices_in_slice = [c[1] for c in cells_needed]
+            global_positions = [c[0] for c in cells_needed]
             
-            if not all_expression:
-                return
+            # 读取切片数据
+            slice_info = slice_info_map[slice_idx]
+            slice_data = self._load_slice_data(slice_info, row_indices=cell_indices_in_slice)
+            
+            expr = slice_data['expression']
+            pos = slice_data['positions']
+            ct = slice_data['cell_types']
+            if ct is None:
+                ct = np.full(len(cell_indices_in_slice), -1, dtype=np.int32)
+            
+            # 直接写入 memmap 对应位置（写磁盘，不占内存）
+            for i, global_pos in enumerate(global_positions):
+                expr_mmap[global_pos] = expr[i]
+                pos_mmap[global_pos] = pos[i]
+                ct_mmap[global_pos] = ct[i]
+                sid_mmap[global_pos] = slice_idx
+            
+            # 定期 flush 确保写入磁盘
+            if slice_idx % 10 == 0:
+                expr_mmap.flush()
+                pos_mmap.flush()
+                ct_mmap.flush()
+                sid_mmap.flush()
+        
+        # 最终 flush
+        expr_mmap.flush()
+        pos_mmap.flush()
+        ct_mmap.flush()
+        sid_mmap.flush()
+        
+        # ===== 第四步：分 shard 读取 memmap 并转成 parquet =====
+        logger.info(f"转换为 parquet 文件...")
+        
+        for shard_idx in tqdm(range(n_shards), desc=f"写入 parquet ({split_name})"):
+            start = shard_idx * self.max_shard_size
+            end = min((shard_idx + 1) * self.max_shard_size, n_cells)
+            
+            # 从 memmap 读取这个 shard 的数据
+            shard_expr = expr_mmap[start:end].tolist()
+            shard_pos = pos_mmap[start:end].tolist()
+            shard_ct = ct_mmap[start:end].tolist()
+            shard_sid = sid_mmap[start:end].tolist()
             
             table = pa.table({
-                'expression': pa.array(all_expression),
-                'positions': pa.array(all_positions),
-                'cell_types': pa.array(all_cell_types),
-                'slice_ids': pa.array(all_slice_ids),
+                'expression': pa.array(shard_expr),
+                'positions': pa.array(shard_pos),
+                'cell_types': pa.array(shard_ct),
+                'slice_ids': pa.array(shard_sid),
             })
             
-            # 单文件或多文件命名
-            if n_cells <= self.max_shard_size:
+            if n_shards == 1:
                 output_file = output_dir / f"{split_name}.parquet"
             else:
                 output_file = output_dir / f"{split_name}-{shard_idx:05d}.parquet"
             
             pq.write_table(table, output_file, compression='snappy')
-            logger.info(f"写入 {output_file}: {len(all_expression)} 细胞")
             
-            # 清空缓存
-            all_expression = []
-            all_positions = []
-            all_cell_types = []
-            all_slice_ids = []
-            shard_idx += 1
-            cells_in_current_shard = 0
+            # 释放内存
+            del shard_expr, shard_pos, shard_ct, shard_sid
         
-        # 按切片顺序处理
-        for slice_info in tqdm(metadata['slices'], desc=f"生成 {split_name}"):
-            slice_idx = slice_info['slice_idx'] if 'slice_idx' in slice_info else metadata['slices'].index(slice_info)
-            
-            if slice_idx not in slice_to_cells:
-                continue
-            
-            # ===== 优化：只读取需要的行 =====
-            cells_needed = slice_to_cells[slice_idx]
-            cell_indices = [c[1] for c in cells_needed]
-            
-            # 直接按索引读取（节省内存，支持多文件切片）
-            slice_data = self._load_slice_data(slice_info, row_indices=cell_indices)
-            
-            expr = slice_data['expression']  # 已经是子集
-            pos = slice_data['positions']    # 已经是子集
-            ct = slice_data['cell_types']    # 已经是子集
-            if ct is None:
-                ct = np.full(len(cell_indices), -1, dtype=np.int32)
-            
-            # 添加到缓存
-            for i in range(len(cell_indices)):
-                all_expression.append(expr[i].tolist())
-                all_positions.append(pos[i].tolist())
-                all_cell_types.append(int(ct[i]))
-                all_slice_ids.append(slice_idx)
-                cells_in_current_shard += 1
-                
-                # 达到 shard 大小，写入文件
-                if cells_in_current_shard >= self.max_shard_size:
-                    write_shard()
+        # ===== 第五步：清理临时文件 =====
+        del expr_mmap, pos_mmap, ct_mmap, sid_mmap
         
-        # 写入剩余数据
-        write_shard()
+        import shutil
+        shutil.rmtree(temp_dir)
+        logger.info(f"已清理临时文件: {temp_dir}")
+        
+        logger.info(f"{split_name}: {n_cells} 细胞, {n_shards} 个文件")
         
         return {
             'n_cells': n_cells,
-            'n_shards': shard_idx,
+            'n_shards': n_shards,
             'format': 'parquet',
         }
     
@@ -1100,7 +1133,7 @@ class Stage2BatchGenerator:
         output_dir: Path,
         split_name: str,
     ) -> Dict:
-        """流式生成 pickle 格式的 split（按 batch 保存）"""
+        """流式生成 pickle 格式的 split（memmap 版）"""
         output_dir = output_dir / split_name
         output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -1108,88 +1141,446 @@ class Stage2BatchGenerator:
         if n_cells == 0:
             return {'n_cells': 0, 'n_batches': 0}
         
-        # 按 slice_idx 排序
-        sort_order = np.lexsort((cell_index[:, 1], cell_index[:, 0]))
-        sorted_index = cell_index[sort_order]
+        n_genes = metadata['n_genes']
+        n_batches = (n_cells + self.batch_size - 1) // self.batch_size
         
-        # 构建切片到细胞的映射
+        # ===== 第一步：创建 memmap 临时文件 =====
+        temp_dir = output_dir.parent / f'_temp_{split_name}'
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        expr_mmap = np.memmap(temp_dir / 'expression.dat', dtype=np.float32, mode='w+', shape=(n_cells, n_genes))
+        pos_mmap = np.memmap(temp_dir / 'positions.dat', dtype=np.float32, mode='w+', shape=(n_cells, 3))
+        ct_mmap = np.memmap(temp_dir / 'cell_types.dat', dtype=np.int32, mode='w+', shape=(n_cells,))
+        sid_mmap = np.memmap(temp_dir / 'slice_ids.dat', dtype=np.int32, mode='w+', shape=(n_cells,))
+        
+        ct_mmap[:] = -1
+        sid_mmap[:] = -1
+        
+        # ===== 第二步：构建切片到细胞的映射 =====
         slice_to_cells = {}
-        for global_idx, (slice_idx, cell_idx) in enumerate(sorted_index):
+        for pos, (slice_idx, cell_idx) in enumerate(cell_index):
             slice_idx = int(slice_idx)
             if slice_idx not in slice_to_cells:
                 slice_to_cells[slice_idx] = []
-            slice_to_cells[slice_idx].append((global_idx, int(cell_idx)))
+            slice_to_cells[slice_idx].append((pos, int(cell_idx)))
         
-        # 流式处理，按 batch 保存
-        buffer_expr = []
-        buffer_pos = []
-        buffer_ct = []
-        buffer_slice = []
+        slice_info_map = {
+            (s['slice_idx'] if 'slice_idx' in s else i): s 
+            for i, s in enumerate(metadata['slices'])
+        }
         
-        batch_idx = 0
-        
-        def write_batch():
-            nonlocal batch_idx, buffer_expr, buffer_pos, buffer_ct, buffer_slice
+        # ===== 第三步：遍历切片，写入 memmap =====
+        for slice_idx in tqdm(sorted(slice_to_cells.keys()), desc=f"读取切片 ({split_name})"):
+            cells_needed = slice_to_cells[slice_idx]
+            cell_indices_in_slice = [c[1] for c in cells_needed]
+            global_positions = [c[0] for c in cells_needed]
             
-            if not buffer_expr:
-                return
+            slice_info = slice_info_map[slice_idx]
+            slice_data = self._load_slice_data(slice_info, row_indices=cell_indices_in_slice)
+            
+            expr = slice_data['expression']
+            pos = slice_data['positions']
+            ct = slice_data['cell_types']
+            if ct is None:
+                ct = np.full(len(cell_indices_in_slice), -1, dtype=np.int32)
+            
+            for i, global_pos in enumerate(global_positions):
+                expr_mmap[global_pos] = expr[i]
+                pos_mmap[global_pos] = pos[i]
+                ct_mmap[global_pos] = ct[i]
+                sid_mmap[global_pos] = slice_idx
+            
+            if slice_idx % 10 == 0:
+                expr_mmap.flush()
+                pos_mmap.flush()
+                ct_mmap.flush()
+                sid_mmap.flush()
+        
+        expr_mmap.flush()
+        pos_mmap.flush()
+        ct_mmap.flush()
+        sid_mmap.flush()
+        
+        # ===== 第四步：分 batch 读取并保存 pickle =====
+        for batch_idx in tqdm(range(n_batches), desc=f"写入 pickle ({split_name})"):
+            start = batch_idx * self.batch_size
+            end = min((batch_idx + 1) * self.batch_size, n_cells)
             
             batch_data = {
-                'expression': np.array(buffer_expr, dtype=np.float32),
-                'positions': np.array(buffer_pos, dtype=np.float32),
-                'cell_types': np.array(buffer_ct, dtype=np.int32),
-                'slice_ids': np.array(buffer_slice, dtype=np.int32),
+                'expression': np.array(expr_mmap[start:end]),
+                'positions': np.array(pos_mmap[start:end]),
+                'cell_types': np.array(ct_mmap[start:end]),
+                'slice_ids': np.array(sid_mmap[start:end]),
             }
             
             batch_file = output_dir / f"batch_{batch_idx:06d}.pkl"
             with open(batch_file, 'wb') as f:
                 pickle.dump(batch_data, f)
-            
-            buffer_expr = []
-            buffer_pos = []
-            buffer_ct = []
-            buffer_slice = []
-            batch_idx += 1
         
-        for slice_info in tqdm(metadata['slices'], desc=f"生成 {split_name}"):
-            slice_idx = slice_info['slice_idx'] if 'slice_idx' in slice_info else metadata['slices'].index(slice_info)
-            
-            if slice_idx not in slice_to_cells:
-                continue
-            
-            # ===== 优化：只读取需要的行 =====
-            cells_needed = slice_to_cells[slice_idx]
-            cell_indices = [c[1] for c in cells_needed]
-            
-            # 直接按索引读取（支持多文件切片）
-            slice_data = self._load_slice_data(slice_info, row_indices=cell_indices)
-            
-            expr = slice_data['expression']  # 已经是子集
-            pos = slice_data['positions']    # 已经是子集
-            ct = slice_data['cell_types']    # 已经是子集
-            if ct is None:
-                ct = np.full(len(cell_indices), -1, dtype=np.int32)
-            
-            for i in range(len(cell_indices)):
-                buffer_expr.append(expr[i])
-                buffer_pos.append(pos[i])
-                buffer_ct.append(ct[i])
-                buffer_slice.append(slice_idx)
-                
-                if len(buffer_expr) >= self.batch_size:
-                    write_batch()
+        # ===== 清理 =====
+        del expr_mmap, pos_mmap, ct_mmap, sid_mmap
         
-        # 写入剩余数据
-        if buffer_expr:
-            write_batch()
+        import shutil
+        shutil.rmtree(temp_dir)
+        
+        logger.info(f"{split_name}: {n_cells} 细胞, {n_batches} 个文件")
         
         return {
             'n_cells': n_cells,
-            'n_batches': batch_idx,
+            'n_batches': n_batches,
             'batch_size': self.batch_size,
             'format': 'pickle',
         }
     
+    def _generate_all_splits_parquet(
+        self,
+        split_indices: Dict[str, np.ndarray],
+        metadata: Dict,
+        output_dir: Path,
+    ) -> Dict:
+        """
+        优化版：一次遍历切片，同时生成所有 split 的 parquet 文件
+        
+        策略：
+        1. 同时创建 train/val/test 三个 memmap
+        2. 遍历切片时，根据细胞属于哪个 split，写入对应的 memmap
+        3. 分别转成 parquet
+        
+        IO 复杂度：O(切片数) - 每个切片只读一次！（比之前减少 2/3）
+        """
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            logger.warning("pyarrow 未安装，使用 pickle 格式")
+            return self._generate_all_splits_pickle(split_indices, metadata, output_dir)
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        n_genes = metadata['n_genes']
+        
+        # ===== 第一步：为每个 split 创建 memmap =====
+        temp_dir = output_dir.parent / '_temp_all_splits'
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"创建临时 memmap 文件: {temp_dir}")
+        
+        # 存储每个 split 的 memmap
+        split_mmaps = {}
+        split_sizes = {}
+        
+        for split_name, cell_index in split_indices.items():
+            n_cells = len(cell_index)
+            split_sizes[split_name] = n_cells
+            
+            if n_cells == 0:
+                split_mmaps[split_name] = None
+                continue
+            
+            split_dir = temp_dir / split_name
+            split_dir.mkdir(parents=True, exist_ok=True)
+            
+            split_mmaps[split_name] = {
+                'expr': np.memmap(split_dir / 'expression.dat', dtype=np.float32, mode='w+', shape=(n_cells, n_genes)),
+                'pos': np.memmap(split_dir / 'positions.dat', dtype=np.float32, mode='w+', shape=(n_cells, 3)),
+                'ct': np.memmap(split_dir / 'cell_types.dat', dtype=np.int32, mode='w+', shape=(n_cells,)),
+                'sid': np.memmap(split_dir / 'slice_ids.dat', dtype=np.int32, mode='w+', shape=(n_cells,)),
+            }
+            
+            # 初始化
+            split_mmaps[split_name]['ct'][:] = -1
+            split_mmaps[split_name]['sid'][:] = -1
+        
+        # ===== 第二步：构建全局映射（切片 -> 各 split 的细胞）=====
+        # slice_to_cells[slice_idx][split_name] = [(memmap中的位置, slice内的cell_idx), ...]
+        slice_to_cells = {}
+        
+        for split_name, cell_index in split_indices.items():
+            for pos, (slice_idx, cell_idx) in enumerate(cell_index):
+                slice_idx = int(slice_idx)
+                if slice_idx not in slice_to_cells:
+                    slice_to_cells[slice_idx] = {s: [] for s in split_indices.keys()}
+                slice_to_cells[slice_idx][split_name].append((pos, int(cell_idx)))
+        
+        # 构建 slice_idx -> slice_info 的映射
+        slice_info_map = {
+            (s['slice_idx'] if 'slice_idx' in s else i): s 
+            for i, s in enumerate(metadata['slices'])
+        }
+        
+        # ===== 第三步：遍历切片，每个只读一次，写入各 split 的 memmap =====
+        logger.info(f"遍历切片写入 memmap（每个切片只读一次）...")
+        
+        for slice_idx in tqdm(sorted(slice_to_cells.keys()), desc="读取切片"):
+            # 收集该切片在所有 split 中需要的 cell_idx
+            all_cell_indices_needed = set()
+            for split_name in split_indices.keys():
+                for _, cell_idx in slice_to_cells[slice_idx][split_name]:
+                    all_cell_indices_needed.add(cell_idx)
+            
+            if not all_cell_indices_needed:
+                continue
+            
+            all_cell_indices_list = sorted(all_cell_indices_needed)
+            
+            # 读取切片数据（只读一次！）
+            slice_info = slice_info_map[slice_idx]
+            slice_data = self._load_slice_data(slice_info, row_indices=all_cell_indices_list)
+            
+            expr = slice_data['expression']
+            pos = slice_data['positions']
+            ct = slice_data['cell_types']
+            if ct is None:
+                ct = np.full(len(all_cell_indices_list), -1, dtype=np.int32)
+            
+            # 构建 cell_idx -> 读取数据中的位置
+            cell_idx_to_data_pos = {cell_idx: i for i, cell_idx in enumerate(all_cell_indices_list)}
+            
+            # 分发到各 split 的 memmap
+            for split_name in split_indices.keys():
+                if split_mmaps[split_name] is None:
+                    continue
+                
+                for memmap_pos, cell_idx in slice_to_cells[slice_idx][split_name]:
+                    data_pos = cell_idx_to_data_pos[cell_idx]
+                    split_mmaps[split_name]['expr'][memmap_pos] = expr[data_pos]
+                    split_mmaps[split_name]['pos'][memmap_pos] = pos[data_pos]
+                    split_mmaps[split_name]['ct'][memmap_pos] = ct[data_pos]
+                    split_mmaps[split_name]['sid'][memmap_pos] = slice_idx
+            
+            # 定期 flush
+            if slice_idx % 10 == 0:
+                for split_name in split_indices.keys():
+                    if split_mmaps[split_name] is not None:
+                        for mmap in split_mmaps[split_name].values():
+                            mmap.flush()
+        
+        # 最终 flush
+        for split_name in split_indices.keys():
+            if split_mmaps[split_name] is not None:
+                for mmap in split_mmaps[split_name].values():
+                    mmap.flush()
+        
+        # ===== 第四步：各 split 转成 parquet =====
+        logger.info(f"转换为 parquet 文件...")
+        
+        stats = {}
+        
+        for split_name in split_indices.keys():
+            n_cells = split_sizes[split_name]
+            
+            if n_cells == 0:
+                stats[split_name] = {'n_cells': 0, 'n_shards': 0, 'format': 'parquet'}
+                continue
+            
+            n_shards = (n_cells + self.max_shard_size - 1) // self.max_shard_size
+            
+            mmaps = split_mmaps[split_name]
+            
+            for shard_idx in tqdm(range(n_shards), desc=f"写入 parquet ({split_name})"):
+                start = shard_idx * self.max_shard_size
+                end = min((shard_idx + 1) * self.max_shard_size, n_cells)
+                
+                shard_expr = mmaps['expr'][start:end].tolist()
+                shard_pos = mmaps['pos'][start:end].tolist()
+                shard_ct = mmaps['ct'][start:end].tolist()
+                shard_sid = mmaps['sid'][start:end].tolist()
+                
+                table = pa.table({
+                    'expression': pa.array(shard_expr),
+                    'positions': pa.array(shard_pos),
+                    'cell_types': pa.array(shard_ct),
+                    'slice_ids': pa.array(shard_sid),
+                })
+                
+                if n_shards == 1:
+                    output_file = output_dir / f"{split_name}.parquet"
+                else:
+                    output_file = output_dir / f"{split_name}-{shard_idx:05d}.parquet"
+                
+                pq.write_table(table, output_file, compression='snappy')
+                
+                del shard_expr, shard_pos, shard_ct, shard_sid
+            
+            stats[split_name] = {
+                'n_cells': n_cells,
+                'n_shards': n_shards,
+                'format': 'parquet',
+            }
+            
+            logger.info(f"{split_name}: {n_cells} 细胞, {n_shards} 个文件")
+        
+        # ===== 第五步：清理临时文件 =====
+        for split_name in split_indices.keys():
+            if split_mmaps[split_name] is not None:
+                for mmap in split_mmaps[split_name].values():
+                    del mmap
+        
+        import shutil
+        shutil.rmtree(temp_dir)
+        logger.info(f"已清理临时文件: {temp_dir}")
+        
+        return stats
+    
+    def _generate_all_splits_pickle(
+        self,
+        split_indices: Dict[str, np.ndarray],
+        metadata: Dict,
+        output_dir: Path,
+    ) -> Dict:
+        """
+        优化版：一次遍历切片，同时生成所有 split 的 pickle 文件
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        n_genes = metadata['n_genes']
+        
+        # ===== 第一步：为每个 split 创建 memmap =====
+        temp_dir = output_dir.parent / '_temp_all_splits'
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"创建临时 memmap 文件: {temp_dir}")
+        
+        split_mmaps = {}
+        split_sizes = {}
+        
+        for split_name, cell_index in split_indices.items():
+            n_cells = len(cell_index)
+            split_sizes[split_name] = n_cells
+            
+            if n_cells == 0:
+                split_mmaps[split_name] = None
+                continue
+            
+            split_dir = temp_dir / split_name
+            split_dir.mkdir(parents=True, exist_ok=True)
+            
+            split_mmaps[split_name] = {
+                'expr': np.memmap(split_dir / 'expression.dat', dtype=np.float32, mode='w+', shape=(n_cells, n_genes)),
+                'pos': np.memmap(split_dir / 'positions.dat', dtype=np.float32, mode='w+', shape=(n_cells, 3)),
+                'ct': np.memmap(split_dir / 'cell_types.dat', dtype=np.int32, mode='w+', shape=(n_cells,)),
+                'sid': np.memmap(split_dir / 'slice_ids.dat', dtype=np.int32, mode='w+', shape=(n_cells,)),
+            }
+            
+            split_mmaps[split_name]['ct'][:] = -1
+            split_mmaps[split_name]['sid'][:] = -1
+        
+        # ===== 第二步：构建全局映射 =====
+        slice_to_cells = {}
+        
+        for split_name, cell_index in split_indices.items():
+            for pos, (slice_idx, cell_idx) in enumerate(cell_index):
+                slice_idx = int(slice_idx)
+                if slice_idx not in slice_to_cells:
+                    slice_to_cells[slice_idx] = {s: [] for s in split_indices.keys()}
+                slice_to_cells[slice_idx][split_name].append((pos, int(cell_idx)))
+        
+        slice_info_map = {
+            (s['slice_idx'] if 'slice_idx' in s else i): s 
+            for i, s in enumerate(metadata['slices'])
+        }
+        
+        # ===== 第三步：遍历切片，写入 memmap =====
+        logger.info(f"遍历切片写入 memmap（每个切片只读一次）...")
+        
+        for slice_idx in tqdm(sorted(slice_to_cells.keys()), desc="读取切片"):
+            all_cell_indices_needed = set()
+            for split_name in split_indices.keys():
+                for _, cell_idx in slice_to_cells[slice_idx][split_name]:
+                    all_cell_indices_needed.add(cell_idx)
+            
+            if not all_cell_indices_needed:
+                continue
+            
+            all_cell_indices_list = sorted(all_cell_indices_needed)
+            
+            slice_info = slice_info_map[slice_idx]
+            slice_data = self._load_slice_data(slice_info, row_indices=all_cell_indices_list)
+            
+            expr = slice_data['expression']
+            pos = slice_data['positions']
+            ct = slice_data['cell_types']
+            if ct is None:
+                ct = np.full(len(all_cell_indices_list), -1, dtype=np.int32)
+            
+            cell_idx_to_data_pos = {cell_idx: i for i, cell_idx in enumerate(all_cell_indices_list)}
+            
+            for split_name in split_indices.keys():
+                if split_mmaps[split_name] is None:
+                    continue
+                
+                for memmap_pos, cell_idx in slice_to_cells[slice_idx][split_name]:
+                    data_pos = cell_idx_to_data_pos[cell_idx]
+                    split_mmaps[split_name]['expr'][memmap_pos] = expr[data_pos]
+                    split_mmaps[split_name]['pos'][memmap_pos] = pos[data_pos]
+                    split_mmaps[split_name]['ct'][memmap_pos] = ct[data_pos]
+                    split_mmaps[split_name]['sid'][memmap_pos] = slice_idx
+            
+            if slice_idx % 10 == 0:
+                for split_name in split_indices.keys():
+                    if split_mmaps[split_name] is not None:
+                        for mmap in split_mmaps[split_name].values():
+                            mmap.flush()
+        
+        for split_name in split_indices.keys():
+            if split_mmaps[split_name] is not None:
+                for mmap in split_mmaps[split_name].values():
+                    mmap.flush()
+        
+        # ===== 第四步：各 split 转成 pickle =====
+        logger.info(f"转换为 pickle 文件...")
+        
+        stats = {}
+        
+        for split_name in split_indices.keys():
+            n_cells = split_sizes[split_name]
+            
+            if n_cells == 0:
+                stats[split_name] = {'n_cells': 0, 'n_batches': 0, 'format': 'pickle'}
+                continue
+            
+            split_output_dir = output_dir / split_name
+            split_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            n_batches = (n_cells + self.batch_size - 1) // self.batch_size
+            mmaps = split_mmaps[split_name]
+            
+            for batch_idx in tqdm(range(n_batches), desc=f"写入 pickle ({split_name})"):
+                start = batch_idx * self.batch_size
+                end = min((batch_idx + 1) * self.batch_size, n_cells)
+                
+                batch_data = {
+                    'expression': np.array(mmaps['expr'][start:end]),
+                    'positions': np.array(mmaps['pos'][start:end]),
+                    'cell_types': np.array(mmaps['ct'][start:end]),
+                    'slice_ids': np.array(mmaps['sid'][start:end]),
+                }
+                
+                batch_file = split_output_dir / f"batch_{batch_idx:06d}.pkl"
+                with open(batch_file, 'wb') as f:
+                    pickle.dump(batch_data, f)
+            
+            stats[split_name] = {
+                'n_cells': n_cells,
+                'n_batches': n_batches,
+                'batch_size': self.batch_size,
+                'format': 'pickle',
+            }
+            
+            logger.info(f"{split_name}: {n_cells} 细胞, {n_batches} 个文件")
+        
+        # ===== 第五步：清理 =====
+        for split_name in split_indices.keys():
+            if split_mmaps[split_name] is not None:
+                for mmap in split_mmaps[split_name].values():
+                    del mmap
+        
+        import shutil
+        shutil.rmtree(temp_dir)
+        logger.info(f"已清理临时文件: {temp_dir}")
+        
+        return stats
+
     def _save_dataset_info(self, output_dir, metadata, stats):
         """保存数据集信息（HuggingFace 格式）"""
         
