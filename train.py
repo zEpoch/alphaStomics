@@ -291,20 +291,25 @@ def main():
         yaml.dump(config, f, default_flow_style=False)
     logger.info(f"Saved config to {config_save_path}")
     
-    # TODO: 创建数据模块
-    # 这里需要你根据实际的数据格式实现 DataModule
-    # from your_data_module import AlphaSTomicsDataModule
-    # datamodule = AlphaSTomicsDataModule(
-    #     data_dir=args.data_dir,
-    #     batch_size=config['training']['batch_size'],
-    #     num_workers=args.num_workers
-    # )
+    # 创建数据加载器
+    from alphastomics.preprocessing import create_dataloaders
+    
+    train_loader, val_loader, test_loader, metadata = create_dataloaders(
+        data_dir=args.data_dir,
+        batch_size=config['training']['batch_size'],
+        num_workers=args.num_workers,
+        streaming=False,  # 可以添加 --streaming 参数来启用
+    )
+    
+    # 获取基因数量
+    num_genes = metadata.get('n_genes', args.num_genes)
+    logger.info(f"Loaded data: {num_genes} genes")
     
     # 创建模型
     logger.info("Creating model...")
     model = AlphaSTomicsModule(
         cfg=config,
-        num_genes=args.num_genes
+        num_genes=num_genes
     )
     
     # 统计参数
@@ -356,12 +361,16 @@ def main():
     # 开始训练
     logger.info("Starting training...")
     
-    # TODO: 取消注释以下行，并提供 datamodule
-    # trainer.fit(
-    #     model,
-    #     datamodule=datamodule,
-    #     ckpt_path=args.resume_from
-    # )
+    trainer.fit(
+        model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=args.resume_from
+    )
+    
+    # 测试
+    logger.info("Running test...")
+    trainer.test(model, dataloaders=test_loader)
     
     logger.info("Training completed!")
     logger.info(f"Results saved to {output_dir}")

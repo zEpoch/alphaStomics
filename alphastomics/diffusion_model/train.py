@@ -237,6 +237,11 @@ class AlphaSTomicsModule(pl.LightningModule):
             compute_position=noise_position
         )
         
+        # 添加 MoE 辅助损失（如果启用）
+        if moe_aux_loss is not None:
+            loss = loss + moe_aux_loss
+            log_dict["loss/moe_aux"] = moe_aux_loss.item()
+        
         # 计算 Masked Reconstruction 损失（如果启用）
         if mask_info is not None and mask_info.has_mask():
             recon_loss, recon_log_dict = self.loss_fn.compute_masked_reconstruction_loss(
@@ -298,6 +303,10 @@ class AlphaSTomicsModule(pl.LightningModule):
             compute_expression=noise_expression,
             compute_position=noise_position
         )
+        
+        # 添加 MoE 辅助损失用于日志记录（验证时不用于梯度更新）
+        if moe_aux_loss is not None:
+            log_dict["loss/moe_aux"] = moe_aux_loss.item()
         
         self.log_dict(
             {f"val/{k}": v for k, v in log_dict.items()},
